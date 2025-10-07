@@ -1,1 +1,3721 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
 
+// OpenZeppelin (pinned version) imports via HTTPS so Remix compiles out of the box.
+import {Ownable} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/access/Ownable.sol";
+import {IERC20} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC20/utils/SafeERC20.sol";
+
+/**
+ * @title WorldGameTreasury
+ * @notice Central sink for all fees and payments in the game.
+ *         - Receives ETH and ERC20 and immediately forwards to the `treasury` address.
+ *         - Exposes helper methods for contracts/EOAs to forward funds directly.
+ *         - Owner can update the treasury address and rescue funds in emergencies.
+ *
+ * @dev Keep this contract extremely small and dependency-pinned so it compiles
+ *      cleanly in Remix without "stack too deep" or IR-related settings.
+ */
+contract WorldGameTreasury is Ownable {
+    using SafeERC20 for IERC20;
+
+    /// @notice Destination that receives every forwarded payment (ETH & ERC20).
+    address public treasury;
+
+    /// -----------------------------------------------------------------------
+    /// Errors
+    /// -----------------------------------------------------------------------
+    error InvalidTreasury();
+    error ForwardFailed();
+
+    /// -----------------------------------------------------------------------
+    /// Events
+    /// -----------------------------------------------------------------------
+    event TreasuryUpdated(address indexed previousTreasury, address indexed newTreasury);
+    /// @param token address(0) for native ETH
+    event PaymentForwarded(address indexed token, uint256 amount);
+    /// @param token address(0) for native ETH
+    event FundsWithdrawn(address indexed token, uint256 amount, address indexed to);
+
+    /// -----------------------------------------------------------------------
+    /// Constructor
+    /// -----------------------------------------------------------------------
+
+    /**
+     * @param initialTreasury EOA/contract that will receive all forwarded funds.
+     * @param initialOwner    Owner of this contract (can update treasury & rescue).
+     */
+    constructor(address initialTreasury, address initialOwner) Ownable(initialOwner) {
+        if (initialTreasury == address(0)) revert InvalidTreasury();
+        treasury = initialTreasury;
+        emit TreasuryUpdated(address(0), initialTreasury);
+    }
+
+    /// -----------------------------------------------------------------------
+    /// Admin
+    /// -----------------------------------------------------------------------
+
+    /**
+     * @notice Update the treasury recipient.
+     */
+    function setTreasury(address newTreasury) external onlyOwner {
+        if (newTreasury == address(0)) revert InvalidTreasury();
+        address prev = treasury;
+        treasury = newTreasury;
+        emit TreasuryUpdated(prev, newTreasury);
+    }
+
+    /// -----------------------------------------------------------------------
+    /// Receive & Forward
+    /// -----------------------------------------------------------------------
+
+    /**
+     * @notice Receive native ETH and auto-forward to `treasury`.
+     */
+    receive() external payable {
+        _forwardETH(msg.value);
+    }
+
+    /**
+     * @notice Fallback in case ETH is sent via call with data.
+     */
+    fallback() external payable {
+        if (msg.value > 0) {
+            _forwardETH(msg.value);
+        }
+    }
+
+    /**
+     * @notice Helper: pull ERC20 from the caller (requires allowance) and forward to treasury.
+     * @dev Useful for EOAs or contracts that want to send funds directly without this contract holding balances.
+     */
+    function payERC20(IERC20 token, uint256 amount) external {
+        if (amount == 0) return;
+        token.safeTransferFrom(msg.sender, treasury, amount);
+        emit PaymentForwarded(address(token), amount);
+    }
+
+    /**
+     * @notice Manually forward any ERC20 balance held by this contract to `treasury`.
+     * @dev Safe to call repeatedly; no effect if balance is zero.
+     */
+    function forwardERC20(IERC20 token) external {
+        uint256 bal = token.balanceOf(address(this));
+        if (bal == 0) return;
+        token.safeTransfer(treasury, bal);
+        emit PaymentForwarded(address(token), bal);
+    }
+
+    /**
+     * @notice Manually forward all ETH balance held by this contract to `treasury`.
+     */
+    function forwardETH() external {
+        uint256 bal = address(this).balance;
+        if (bal == 0) return;
+        _forwardETH(bal);
+    }
+
+    /// -----------------------------------------------------------------------
+    /// Rescue (Owner)
+    /// -----------------------------------------------------------------------
+
+    /**
+     * @notice Rescue ERC20 to any address (defaults typically should be `treasury` or `owner()`).
+     */
+    function rescueERC20(IERC20 token, uint256 amount, address to) external onlyOwner {
+        if (amount == 0) return;
+        if (to == address(0)) revert InvalidTreasury();
+        token.safeTransfer(to, amount);
+        emit FundsWithdrawn(address(token), amount, to);
+    }
+
+    /**
+     * @notice Rescue ETH to any address (defaults typically should be `treasury` or `owner()`).
+     */
+    function rescueETH(uint256 amount, address to) external onlyOwner {
+        if (amount == 0) return;
+        if (to == address(0)) revert InvalidTreasury();
+        (bool ok, ) = payable(to).call{value: amount}("");
+        if (!ok) revert ForwardFailed();
+        emit FundsWithdrawn(address(0), amount, to);
+    }
+
+    /// -----------------------------------------------------------------------
+    /// Internal
+    /// -----------------------------------------------------------------------
+
+    function _forwardETH(uint256 amount) internal {
+        if (amount == 0) return;
+        (bool ok, ) = payable(treasury).call{value: amount}("");
+        if (!ok) revert ForwardFailed();
+        emit PaymentForwarded(address(0), amount);
+    }
+}
+
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+// OpenZeppelin v5.0.2 pinned imports for smooth Remix compilation.
+import {ERC20} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC20/ERC20.sol";
+import {ERC20Burnable} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC20/extensions/ERC20Burnable.sol";
+import {AccessControl} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/access/AccessControl.sol";
+import {Ownable} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/access/Ownable.sol";
+
+/**
+ * @title WorldGameUsd (WGU)
+ * @notice In‑game currency (2 decimals). Mint/Burn controlled by roles:
+ *         - MINTER_ROLE: whitelisted venues (and owner) can mint wages/rewards.
+ *         - BURNER_ROLE: whitelisted venues (and owner) can burn (e.g., buybacks).
+ *         Holders can also self-burn via ERC20Burnable.
+ *
+ * @dev Minimal surface to avoid stack-too-deep / IR toggles; imports are pinned.
+ */
+contract WorldGameUsd is ERC20, ERC20Burnable, AccessControl, Ownable {
+    // -----------------------------
+    // Roles
+    // -----------------------------
+    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+    bytes32 public constant BURNER_ROLE = keccak256("BURNER_ROLE");
+
+    // -----------------------------
+    // Constructor
+    // -----------------------------
+
+    /**
+     * @param initialOwner The admin EOA (DEFAULT_ADMIN_ROLE + Ownable owner).
+     */
+    constructor(address initialOwner)
+        ERC20("WorldGameUsd", "WGU")
+        Ownable(initialOwner)
+    {
+        // Set up AccessControl admin & default roles to the owner.
+        _grantRole(DEFAULT_ADMIN_ROLE, initialOwner);
+        _grantRole(MINTER_ROLE, initialOwner);
+        _grantRole(BURNER_ROLE, initialOwner);
+    }
+
+    // -----------------------------
+    // ERC20 config
+    // -----------------------------
+
+    /// @notice WGU uses 2 decimals.
+    function decimals() public pure override returns (uint8) {
+        return 2;
+    }
+
+    // -----------------------------
+    // Mint / Burn (admin/venues)
+    // -----------------------------
+
+    /// @notice Mint to `to` (requires MINTER_ROLE).
+    function mint(address to, uint256 amount) external onlyRole(MINTER_ROLE) {
+        _mint(to, amount);
+    }
+
+    /// @notice Burn from `account` without allowance (requires BURNER_ROLE).
+    function adminBurnFrom(address account, uint256 amount) external onlyRole(BURNER_ROLE) {
+        _burn(account, amount);
+    }
+
+    // -----------------------------
+    // ERC165
+    // -----------------------------
+
+    function supportsInterface(bytes4 interfaceId)
+        public
+        view
+        override(AccessControl)
+        returns (bool)
+    {
+        return super.supportsInterface(interfaceId);
+    }
+}
+
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+// OpenZeppelin v5.0.2 pinned imports for smooth Remix compilation.
+import {ERC20} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC20/ERC20.sol";
+import {ERC20Burnable} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC20/extensions/ERC20Burnable.sol";
+import {AccessControl} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/access/AccessControl.sol";
+import {Ownable} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/access/Ownable.sol";
+
+/**
+ * @title WorldGameFood (WGF)
+ * @notice Food token (0 decimals) consumed to fuel 10h work sessions.
+ *         Roles:
+ *           - MINTER_ROLE: shops/factories (and owner) can mint WGF.
+ *           - BURNER_ROLE: venues (and owner) can burn from accounts (e.g., refuel at home).
+ *         Holders can also self-burn via ERC20Burnable.
+ */
+contract WorldGameFood is ERC20, ERC20Burnable, AccessControl, Ownable {
+    // -----------------------------
+    // Roles
+    // -----------------------------
+    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+    bytes32 public constant BURNER_ROLE = keccak256("BURNER_ROLE");
+
+    // -----------------------------
+    // Constructor
+    // -----------------------------
+
+    /**
+     * @param initialOwner The admin EOA (DEFAULT_ADMIN_ROLE + Ownable owner).
+     */
+    constructor(address initialOwner)
+        ERC20("WorldGameFood", "WGF")
+        Ownable(initialOwner)
+    {
+        // Set up AccessControl admin & default roles to the owner.
+        _grantRole(DEFAULT_ADMIN_ROLE, initialOwner);
+        _grantRole(MINTER_ROLE, initialOwner);
+        _grantRole(BURNER_ROLE, initialOwner);
+    }
+
+    // -----------------------------
+    // ERC20 config
+    // -----------------------------
+
+    /// @notice WGF uses 0 decimals.
+    function decimals() public pure override returns (uint8) {
+        return 0;
+    }
+
+    // -----------------------------
+    // Mint / Burn (admin/venues)
+    // -----------------------------
+
+    /// @notice Mint to `to` (requires MINTER_ROLE).
+    function mint(address to, uint256 amount) external onlyRole(MINTER_ROLE) {
+        _mint(to, amount);
+    }
+
+    /// @notice Burn from `account` without allowance (requires BURNER_ROLE).
+    function adminBurnFrom(address account, uint256 amount) external onlyRole(BURNER_ROLE) {
+        _burn(account, amount);
+    }
+
+    // -----------------------------
+    // ERC165
+    // -----------------------------
+
+    function supportsInterface(bytes4 interfaceId)
+        public
+        view
+        override(AccessControl)
+        returns (bool)
+    {
+        return super.supportsInterface(interfaceId);
+    }
+}
+
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+// OpenZeppelin v5.0.2 pinned imports for smooth Remix compilation.
+import {ERC1155} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC1155/ERC1155.sol";
+import {ERC1155Burnable} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC1155/extensions/ERC1155Burnable.sol";
+import {AccessControl} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/access/AccessControl.sol";
+import {Ownable} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/access/Ownable.sol";
+
+/**
+ * @title WorldGameItems1155
+ * @notice Unified ERC1155 inventory for raw materials, pills, and other items.
+ *         - MINTER_ROLE: factories/venues (and owner) can mint outputs.
+ *         - BURNER_ROLE: pharmacy/venues (and owner) can burn from accounts.
+ *         - Holders may self-burn via ERC1155Burnable.
+ *
+ * @dev Minimal surface, dependency-pinned for clean Remix compilation.
+ */
+contract WorldGameItems1155 is ERC1155, ERC1155Burnable, AccessControl, Ownable {
+    // ---------------------------------------------------------------------
+    // Roles
+    // ---------------------------------------------------------------------
+    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+    bytes32 public constant BURNER_ROLE = keccak256("BURNER_ROLE");
+
+    // ---------------------------------------------------------------------
+    // Constructor
+    // ---------------------------------------------------------------------
+
+    /**
+     * @param initialOwner The admin EOA (DEFAULT_ADMIN_ROLE + Ownable owner).
+     * @param initialURI   Base metadata URI. Supports {id} substitution per ERC1155.
+     *                     Example: "ipfs://Qm.../{id}.json"
+     */
+    constructor(address initialOwner, string memory initialURI)
+        ERC1155(initialURI)
+        Ownable(initialOwner)
+    {
+        _grantRole(DEFAULT_ADMIN_ROLE, initialOwner);
+        _grantRole(MINTER_ROLE, initialOwner);
+        _grantRole(BURNER_ROLE, initialOwner);
+    }
+
+    // ---------------------------------------------------------------------
+    // Admin
+    // ---------------------------------------------------------------------
+
+    /**
+     * @notice Update the base URI (e.g., to migrate metadata).
+     */
+    function setBaseURI(string calldata newURI) external onlyOwner {
+        _setURI(newURI);
+    }
+
+    // ---------------------------------------------------------------------
+    // Mint / Burn (venues)
+    // ---------------------------------------------------------------------
+
+    /// @notice Mint a single id to `to` (requires MINTER_ROLE).
+    function mint(address to, uint256 id, uint256 amount, bytes calldata data)
+        external
+        onlyRole(MINTER_ROLE)
+    {
+        _mint(to, id, amount, data);
+    }
+
+    /// @notice Mint multiple ids to `to` (requires MINTER_ROLE).
+    function mintBatch(address to, uint256[] calldata ids, uint256[] calldata amounts, bytes calldata data)
+        external
+        onlyRole(MINTER_ROLE)
+    {
+        _mintBatch(to, ids, amounts, data);
+    }
+
+    /// @notice Burn from `account` without approval (requires BURNER_ROLE).
+    function adminBurnFrom(address account, uint256 id, uint256 amount)
+        external
+        onlyRole(BURNER_ROLE)
+    {
+        _burn(account, id, amount);
+    }
+
+    /// @notice Burn multiple ids from `account` without approval (requires BURNER_ROLE).
+    function adminBurnBatch(address account, uint256[] calldata ids, uint256[] calldata amounts)
+        external
+        onlyRole(BURNER_ROLE)
+    {
+        _burnBatch(account, ids, amounts);
+    }
+
+    // ---------------------------------------------------------------------
+    // ERC165
+    // ---------------------------------------------------------------------
+
+    function supportsInterface(bytes4 interfaceId)
+        public
+        view
+        override(AccessControl, ERC1155)
+        returns (bool)
+    {
+        return super.supportsInterface(interfaceId);
+    }
+}
+
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import {Ownable} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/access/Ownable.sol";
+
+/**
+ * @title EducationRegistry
+ * @notice Domain-scoped updater registry for Education (schools/colleges/universities).
+ *         - Default deny-all.
+ *         - Requires BOTH a global permission bitmask AND a per-venue override bitmask.
+ *         - Supports domain-wide pause and per-venue pause.
+ *
+ * @dev Keep intentionally small so it compiles in Remix without special settings.
+ */
+contract EducationRegistry is Ownable {
+    // ---------------------------------------------------------------------
+    // Permission bitmasks (combine as needed)
+    // ---------------------------------------------------------------------
+    uint256 public constant PERM_PLACE            = 1 << 0; // place/enter student
+    uint256 public constant PERM_MARK_COMPLETION  = 1 << 1; // mark education finished
+    uint256 public constant PERM_CHARGE_FEE       = 1 << 2; // charge entry fee (USDC/WGU)
+    uint256 public constant PERM_MISC             = 1 << 3; // reserved/misc future ops
+
+    // ---------------------------------------------------------------------
+    // Storage
+    // ---------------------------------------------------------------------
+
+    /// @notice Domain-wide pause (blocks all checks while true).
+    bool public paused;
+
+    /// @notice Per-venue pause flags.
+    mapping(address => bool) public venuePaused;
+
+    /// @notice Global integrator permissions: integrator => bitmask
+    mapping(address => uint256) private globalPerms;
+
+    /// @notice Per-venue overrides: venue => (integrator => bitmask)
+    mapping(address => mapping(address => uint256)) private venuePerms;
+
+    // ---------------------------------------------------------------------
+    // Events
+    // ---------------------------------------------------------------------
+    event RegistryPaused(bool paused);
+    event VenuePaused(address indexed venue, bool paused);
+
+    event RegistryUpdated(address indexed integrator, uint256 perms);
+    event VenueOverrideUpdated(address indexed venue, address indexed integrator, uint256 perms);
+
+    // ---------------------------------------------------------------------
+    // Constructor
+    // ---------------------------------------------------------------------
+
+    constructor(address initialOwner) Ownable(initialOwner) {}
+
+    // ---------------------------------------------------------------------
+    // Admin: pause controls
+    // ---------------------------------------------------------------------
+
+    function setPaused(bool v) external onlyOwner {
+        paused = v;
+        emit RegistryPaused(v);
+    }
+
+    function setVenuePaused(address venue, bool v) external onlyOwner {
+        venuePaused[venue] = v;
+        emit VenuePaused(venue, v);
+    }
+
+    // ---------------------------------------------------------------------
+    // Admin: permission management
+    // ---------------------------------------------------------------------
+
+    /**
+     * @notice Set global permissions for an integrator (0 to revoke).
+     * @param integrator Contract/address that will integrate with schools.
+     * @param perms Bitmask combining PERM_* constants.
+     */
+    function setGlobalPerm(address integrator, uint256 perms) external onlyOwner {
+        globalPerms[integrator] = perms;
+        emit RegistryUpdated(integrator, perms);
+    }
+
+    /**
+     * @notice Set per-venue override for an integrator (0 to revoke).
+     * @param venue A specific school venue contract.
+     * @param integrator Contract/address to allow for this venue.
+     * @param perms Bitmask combining PERM_* constants.
+     */
+    function setVenuePerm(address venue, address integrator, uint256 perms) external onlyOwner {
+        venuePerms[venue][integrator] = perms;
+        emit VenueOverrideUpdated(venue, integrator, perms);
+    }
+
+    // ---------------------------------------------------------------------
+    // View helpers
+    // ---------------------------------------------------------------------
+
+    /// @notice Returns the global permission bitmask for an integrator.
+    function getGlobalPerm(address integrator) external view returns (uint256) {
+        return globalPerms[integrator];
+    }
+
+    /// @notice Returns the per-venue permission bitmask for an integrator.
+    function getVenuePerm(address venue, address integrator) external view returns (uint256) {
+        return venuePerms[venue][integrator];
+    }
+
+    /**
+     * @notice Check if `integrator` is allowed to perform operation(s) requiring `requiredMask` on `venue`.
+     *         Requires: !paused, !venuePaused[venue], (globalPerm & requiredMask) != 0 for all bits,
+     *         and (venuePerm & requiredMask) != 0 for all bits.
+     */
+    function isAllowed(address venue, address integrator, uint256 requiredMask) external view returns (bool) {
+        if (paused || venuePaused[venue]) return false;
+        uint256 g = globalPerms[integrator];
+        if ((g & requiredMask) != requiredMask) return false;
+        uint256 v = venuePerms[venue][integrator];
+        if ((v & requiredMask) != requiredMask) return false;
+        return true;
+    }
+}
+
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import {Ownable} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/access/Ownable.sol";
+
+/**
+ * @title WorkRegistry
+ * @notice Domain-scoped updater registry for workplaces/shops/factories.
+ *         - Default deny-all.
+ *         - Requires BOTH a global permission bitmask AND a per-venue override bitmask.
+ *         - Supports domain-wide pause and per-venue pause.
+ */
+contract WorkRegistry is Ownable {
+    // Permission bitmasks
+    uint256 public constant PERM_PLACE        = 1 << 0; // admit/enter worker into a venue slot
+    uint256 public constant PERM_WORK_START   = 1 << 1; // mark work session start
+    uint256 public constant PERM_WORK_END     = 1 << 2; // mark work session end/settle
+    uint256 public constant PERM_PAY_WAGE     = 1 << 3; // trigger WGU wage payout
+    uint256 public constant PERM_AWARD_XP     = 1 << 4; // grant XP
+    uint256 public constant PERM_MEAL_DEBIT   = 1 << 5; // debit WGF (meal/refuel checks)
+    uint256 public constant PERM_MISC         = 1 << 6; // reserved/misc future ops
+
+    // Storage
+    bool public paused;
+    mapping(address => bool) public venuePaused;
+    mapping(address => uint256) private globalPerms; // integrator => bitmask
+    mapping(address => mapping(address => uint256)) private venuePerms; // venue => integrator => bitmask
+
+    // Events
+    event RegistryPaused(bool paused);
+    event VenuePaused(address indexed venue, bool paused);
+    event RegistryUpdated(address indexed integrator, uint256 perms);
+    event VenueOverrideUpdated(address indexed venue, address indexed integrator, uint256 perms);
+
+    constructor(address initialOwner) Ownable(initialOwner) {}
+
+    // Admin: pause controls
+    function setPaused(bool v) external onlyOwner {
+        paused = v;
+        emit RegistryPaused(v);
+    }
+
+    function setVenuePaused(address venue, bool v) external onlyOwner {
+        venuePaused[venue] = v;
+        emit VenuePaused(venue, v);
+    }
+
+    // Admin: permission management
+    function setGlobalPerm(address integrator, uint256 perms) external onlyOwner {
+        globalPerms[integrator] = perms;
+        emit RegistryUpdated(integrator, perms);
+    }
+
+    function setVenuePerm(address venue, address integrator, uint256 perms) external onlyOwner {
+        venuePerms[venue][integrator] = perms;
+        emit VenueOverrideUpdated(venue, integrator, perms);
+    }
+
+    // Views
+    function getGlobalPerm(address integrator) external view returns (uint256) {
+        return globalPerms[integrator];
+    }
+
+    function getVenuePerm(address venue, address integrator) external view returns (uint256) {
+        return venuePerms[venue][integrator];
+    }
+
+    function isAllowed(address venue, address integrator, uint256 requiredMask) external view returns (bool) {
+        if (paused || venuePaused[venue]) return false;
+        uint256 g = globalPerms[integrator];
+        if ((g & requiredMask) != requiredMask) return false;
+        uint256 v = venuePerms[venue][integrator];
+        if ((v & requiredMask) != requiredMask) return false;
+        return true;
+    }
+}
+
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import {Ownable} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/access/Ownable.sol";
+
+/**
+ * @title HousingRegistry
+ * @notice Domain-scoped updater registry for housing/home operations.
+ *         - Default deny-all.
+ *         - Requires BOTH a global permission bitmask AND a per-venue (house contract) override bitmask.
+ *         - Supports domain-wide pause and per-venue pause.
+ *
+ * @dev Kept intentionally small so it compiles cleanly in Remix without special settings.
+ */
+contract HousingRegistry is Ownable {
+    // ---------------------------------------------------------------------
+    // Permission bitmasks (combine as needed)
+    // ---------------------------------------------------------------------
+    uint256 public constant PERM_HOME_ASSIGN       = 1 << 0; // assign/move a resident into a house
+    uint256 public constant PERM_HOME_VACATE       = 1 << 1; // evict/vacate a resident from a house
+    uint256 public constant PERM_MEAL_REFUEL       = 1 << 2; // perform/refuse meal refuel that is home-gated
+    uint256 public constant PERM_CAPACITY_RESERVE  = 1 << 3; // reserve/release baby slot capacity
+    uint256 public constant PERM_MISC              = 1 << 4; // reserved/misc future ops
+
+    // ---------------------------------------------------------------------
+    // Storage
+    // ---------------------------------------------------------------------
+
+    /// @notice Domain-wide pause (blocks all checks while true).
+    bool public paused;
+
+    /// @notice Per-venue pause flags (keyed by specific house/house-manager contract).
+    mapping(address => bool) public venuePaused;
+
+    /// @notice Global integrator permissions: integrator => bitmask
+    mapping(address => uint256) private globalPerms;
+
+    /// @notice Per-venue overrides: venue => (integrator => bitmask)
+    mapping(address => mapping(address => uint256)) private venuePerms;
+
+    // ---------------------------------------------------------------------
+    // Events
+    // ---------------------------------------------------------------------
+    event RegistryPaused(bool paused);
+    event VenuePaused(address indexed venue, bool paused);
+
+    event RegistryUpdated(address indexed integrator, uint256 perms);
+    event VenueOverrideUpdated(address indexed venue, address indexed integrator, uint256 perms);
+
+    // ---------------------------------------------------------------------
+    // Constructor
+    // ---------------------------------------------------------------------
+
+    constructor(address initialOwner) Ownable(initialOwner) {}
+
+    // ---------------------------------------------------------------------
+    // Admin: pause controls
+    // ---------------------------------------------------------------------
+
+    function setPaused(bool v) external onlyOwner {
+        paused = v;
+        emit RegistryPaused(v);
+    }
+
+    function setVenuePaused(address venue, bool v) external onlyOwner {
+        venuePaused[venue] = v;
+        emit VenuePaused(venue, v);
+    }
+
+    // ---------------------------------------------------------------------
+    // Admin: permission management
+    // ---------------------------------------------------------------------
+
+    /**
+     * @notice Set global permissions for an integrator (0 to revoke).
+     * @param integrator Contract/address that will integrate with housing.
+     * @param perms Bitmask combining PERM_* constants.
+     */
+    function setGlobalPerm(address integrator, uint256 perms) external onlyOwner {
+        globalPerms[integrator] = perms;
+        emit RegistryUpdated(integrator, perms);
+    }
+
+    /**
+     * @notice Set per-venue override for an integrator (0 to revoke).
+     * @param venue A specific house/house-manager contract.
+     * @param integrator Contract/address to allow for this venue.
+     * @param perms Bitmask combining PERM_* constants.
+     */
+    function setVenuePerm(address venue, address integrator, uint256 perms) external onlyOwner {
+        venuePerms[venue][integrator] = perms;
+        emit VenueOverrideUpdated(venue, integrator, perms);
+    }
+
+    // ---------------------------------------------------------------------
+    // View helpers
+    // ---------------------------------------------------------------------
+
+    /// @notice Returns the global permission bitmask for an integrator.
+    function getGlobalPerm(address integrator) external view returns (uint256) {
+        return globalPerms[integrator];
+    }
+
+    /// @notice Returns the per-venue permission bitmask for an integrator.
+    function getVenuePerm(address venue, address integrator) external view returns (uint256) {
+        return venuePerms[venue][integrator];
+    }
+
+    /**
+     * @notice Check if `integrator` is allowed to perform operation(s) requiring `requiredMask` on `venue`.
+     *         Requires: !paused, !venuePaused[venue], (globalPerm & requiredMask) == requiredMask,
+     *         and (venuePerm & requiredMask) == requiredMask.
+     */
+    function isAllowed(address venue, address integrator, uint256 requiredMask) external view returns (bool) {
+        if (paused || venuePaused[venue]) return false;
+        uint256 g = globalPerms[integrator];
+        if ((g & requiredMask) != requiredMask) return false;
+        uint256 v = venuePerms[venue][integrator];
+        if ((v & requiredMask) != requiredMask) return false;
+        return true;
+    }
+}
+
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import {Ownable} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/access/Ownable.sol";
+
+/**
+ * @title LandRegistry
+ * @notice Domain-scoped updater registry for land/placement operations.
+ *         - Default deny-all.
+ *         - Requires BOTH a global permission bitmask AND a per-venue override bitmask.
+ *         - Supports domain-wide pause and per-venue pause.
+ *
+ * @dev Kept intentionally small so it compiles cleanly in Remix without special settings.
+ */
+contract LandRegistry is Ownable {
+    // ---------------------------------------------------------------------
+    // Permission bitmasks (combine as needed)
+    // ---------------------------------------------------------------------
+    uint256 public constant PERM_PLACE       = 1 << 0; // place a house/shop/factory/school on a plot
+    uint256 public constant PERM_CLEAR       = 1 << 1; // clear/remove a placement from a plot
+    uint256 public constant PERM_EDIT_FEES   = 1 << 2; // update placement fees or accepted tokens
+    uint256 public constant PERM_MISC        = 1 << 3; // reserved/misc future ops
+
+    // ---------------------------------------------------------------------
+    // Storage
+    // ---------------------------------------------------------------------
+
+    /// @notice Domain-wide pause (blocks all checks while true).
+    bool public paused;
+
+    /// @notice Per-venue pause flags (keyed by specific land manager/land contract).
+    mapping(address => bool) public venuePaused;
+
+    /// @notice Global integrator permissions: integrator => bitmask
+    mapping(address => uint256) private globalPerms;
+
+    /// @notice Per-venue overrides: venue => (integrator => bitmask)
+    mapping(address => mapping(address => uint256)) private venuePerms;
+
+    // ---------------------------------------------------------------------
+    // Events
+    // ---------------------------------------------------------------------
+    event RegistryPaused(bool paused);
+    event VenuePaused(address indexed venue, bool paused);
+
+    event RegistryUpdated(address indexed integrator, uint256 perms);
+    event VenueOverrideUpdated(address indexed venue, address indexed integrator, uint256 perms);
+
+    // ---------------------------------------------------------------------
+    // Constructor
+    // ---------------------------------------------------------------------
+
+    constructor(address initialOwner) Ownable(initialOwner) {}
+
+    // ---------------------------------------------------------------------
+    // Admin: pause controls
+    // ---------------------------------------------------------------------
+
+    function setPaused(bool v) external onlyOwner {
+        paused = v;
+        emit RegistryPaused(v);
+    }
+
+    function setVenuePaused(address venue, bool v) external onlyOwner {
+        venuePaused[venue] = v;
+        emit VenuePaused(venue, v);
+    }
+
+    // ---------------------------------------------------------------------
+    // Admin: permission management
+    // ---------------------------------------------------------------------
+
+    /**
+     * @notice Set global permissions for an integrator (0 to revoke).
+     * @param integrator Contract/address that will integrate with land ops.
+     * @param perms Bitmask combining PERM_* constants.
+     */
+    function setGlobalPerm(address integrator, uint256 perms) external onlyOwner {
+        globalPerms[integrator] = perms;
+        emit RegistryUpdated(integrator, perms);
+    }
+
+    /**
+     * @notice Set per-venue override for an integrator (0 to revoke).
+     * @param venue A specific land manager/land contract.
+     * @param integrator Contract/address to allow for this venue.
+     * @param perms Bitmask combining PERM_* constants.
+     */
+    function setVenuePerm(address venue, address integrator, uint256 perms) external onlyOwner {
+        venuePerms[venue][integrator] = perms;
+        emit VenueOverrideUpdated(venue, integrator, perms);
+    }
+
+    // ---------------------------------------------------------------------
+    // View helpers
+    // ---------------------------------------------------------------------
+
+    /// @notice Returns the global permission bitmask for an integrator.
+    function getGlobalPerm(address integrator) external view returns (uint256) {
+        return globalPerms[integrator];
+    }
+
+    /// @notice Returns the per-venue permission bitmask for an integrator.
+    function getVenuePerm(address venue, address integrator) external view returns (uint256) {
+        return venuePerms[venue][integrator];
+    }
+
+    /**
+     * @notice Check if `integrator` is allowed to perform operation(s) requiring `requiredMask` on `venue`.
+     *         Requires: !paused, !venuePaused[venue], (globalPerm & requiredMask) == requiredMask,
+     *         and (venuePerm & requiredMask) == requiredMask.
+     */
+    function isAllowed(address venue, address integrator, uint256 requiredMask) external view returns (bool) {
+        if (paused || venuePaused[venue]) return false;
+        uint256 g = globalPerms[integrator];
+        if ((g & requiredMask) != requiredMask) return false;
+        uint256 v = venuePerms[venue][integrator];
+        if ((v & requiredMask) != requiredMask) return false;
+        return true;
+    }
+}
+
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import {Ownable} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/access/Ownable.sol";
+import {IERC20} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC20/utils/SafeERC20.sol";
+
+/**
+ * @title LandManager
+ * @notice Manages lands and plots; charges **USDC-only** placement fees;
+ *         records placements (house/shop/factory/education); forwards fees to a Treasury.
+ *         - Launch config: create Land #1 with N plots via constructor (e.g., 100).
+ *         - Fees are per-land & per-building-type; default 1 USDC each, owner-updateable.
+ *         - Owner is fee-exempt.
+ *
+ * @dev Minimal surface for clean Remix compilation (no proxies here).
+ */
+contract LandManager is Ownable {
+    using SafeERC20 for IERC20;
+
+    // -----------------------------
+    // Types
+    // -----------------------------
+    enum BuildingKind {
+        NONE,       // 0
+        HOUSE,      // 1
+        SHOP,       // 2
+        FACTORY,    // 3
+        EDUCATION   // 4
+    }
+
+    struct Land {
+        bool exists;
+        uint256 plotCount; // plots indexed from 1..plotCount
+    }
+
+    struct Placement {
+        address owner;          // who placed/pays
+        BuildingKind kind;      // building type
+        address assetContract;  // ERC721 address (if applicable)
+        uint256 assetId;        // tokenId (if applicable)
+        uint256 placedAt;       // timestamp
+    }
+
+    // -----------------------------
+    // Storage
+    // -----------------------------
+    IERC20 public usdc;            // accepted token (USDC only)
+    address public treasury;       // where fees are sent (Treasury contract or EOA)
+
+    uint256 public nextLandId;     // auto-increment id for createLand()
+
+    mapping(uint256 => Land) public lands; // landId => Land
+    mapping(uint256 => mapping(uint256 => Placement)) public placements; // landId => plotId => placement
+
+    // landId => kind => fee (in USDC's smallest units)
+    mapping(uint256 => mapping(BuildingKind => uint256)) public placementFee;
+
+    // -----------------------------
+    // Events
+    // -----------------------------
+    event TreasuryUpdated(address indexed previous, address indexed current);
+    event USDCUpdated(address indexed previous, address indexed current);
+
+    event LandCreated(uint256 indexed landId, uint256 plotCount);
+    event PlotsEdited(uint256 indexed landId, uint256 previousCount, uint256 newCount);
+
+    event PlacementFeeUpdated(uint256 indexed landId, BuildingKind indexed kind, uint256 fee);
+    event PlotPlaced(
+        uint256 indexed landId,
+        uint256 indexed plotId,
+        BuildingKind indexed kind,
+        address owner,
+        address assetContract,
+        uint256 assetId,
+        uint256 feePaid
+    );
+    event PlotCleared(uint256 indexed landId, uint256 indexed plotId, address by);
+
+    // -----------------------------
+    // Constructor
+    // -----------------------------
+
+    /**
+     * @param initialOwner   Game owner/admin EOA.
+     * @param usdcToken      Native USDC token address on the chain.
+     * @param treasuryAddr   Treasury recipient (contract or EOA).
+     * @param initialPlots   Plot count for Land #1 (e.g., 100).
+     */
+    constructor(address initialOwner, address usdcToken, address treasuryAddr, uint256 initialPlots)
+        Ownable(initialOwner)
+    {
+        require(usdcToken != address(0) && treasuryAddr != address(0), "zero addr");
+        usdc = IERC20(usdcToken);
+        treasury = treasuryAddr;
+
+        // Initialize IDs
+        nextLandId = 1;
+
+        // Create Land #1
+        _createLandInternal(initialPlots);
+
+        // Default fees = 1 USDC (assume 6 decimals), owner can change later.
+        uint256 oneUSDC = 1_000_000;
+        placementFee[1][BuildingKind.HOUSE] = oneUSDC;
+        placementFee[1][BuildingKind.SHOP] = oneUSDC;
+        placementFee[1][BuildingKind.FACTORY] = oneUSDC;
+        placementFee[1][BuildingKind.EDUCATION] = oneUSDC;
+    }
+
+    // -----------------------------
+    // Admin
+    // -----------------------------
+
+    function setTreasury(address newTreasury) external onlyOwner {
+        require(newTreasury != address(0), "zero addr");
+        address prev = treasury;
+        treasury = newTreasury;
+        emit TreasuryUpdated(prev, newTreasury);
+    }
+
+    function setUSDC(address newUSDC) external onlyOwner {
+        require(newUSDC != address(0), "zero addr");
+        address prev = address(usdc);
+        usdc = IERC20(newUSDC);
+        emit USDCUpdated(prev, newUSDC);
+    }
+
+    function createLand(uint256 plotCount) external onlyOwner returns (uint256 landId) {
+        landId = _createLandInternal(plotCount);
+    }
+
+    function setPlotCount(uint256 landId, uint256 newCount) external onlyOwner {
+        Land storage l = lands[landId];
+        require(l.exists, "land !exists");
+        require(newCount >= l.plotCount, "cannot shrink");
+        uint256 prev = l.plotCount;
+        l.plotCount = newCount;
+        emit PlotsEdited(landId, prev, newCount);
+    }
+
+    function setPlacementFee(uint256 landId, BuildingKind kind, uint256 fee) external onlyOwner {
+        require(lands[landId].exists, "land !exists");
+        require(kind != BuildingKind.NONE, "invalid kind");
+        placementFee[landId][kind] = fee;
+        emit PlacementFeeUpdated(landId, kind, fee);
+    }
+
+    // -----------------------------
+    // Place / Clear
+    // -----------------------------
+
+    /**
+     * @notice Place a building on an empty plot. Caller becomes the record owner.
+     *         - Non-owner callers must pay the per-kind USDC fee (approve first).
+     *         - Owner (contract owner) is fee-exempt.
+     * @param landId The land identifier.
+     * @param plotId The plot (1..plotCount).
+     * @param kind Building kind enum value.
+     * @param assetContract ERC721 contract address (optional, can be zero).
+     * @param assetId ERC721 tokenId (optional).
+     */
+    function place(
+        uint256 landId,
+        uint256 plotId,
+        BuildingKind kind,
+        address assetContract,
+        uint256 assetId
+    ) external {
+        Land storage l = lands[landId];
+        require(l.exists, "land !exists");
+        require(plotId >= 1 && plotId <= l.plotCount, "plot OOB");
+        require(kind != BuildingKind.NONE, "invalid kind");
+
+        Placement storage p = placements[landId][plotId];
+        require(p.owner == address(0), "occupied");
+
+        uint256 fee = placementFee[landId][kind];
+        uint256 paid = 0;
+        if (msg.sender != owner() && fee > 0) {
+            // Pull USDC from caller to treasury (requires prior approval).
+            usdc.safeTransferFrom(msg.sender, treasury, fee);
+            paid = fee;
+        }
+
+        placements[landId][plotId] = Placement({
+            owner: msg.sender,
+            kind: kind,
+            assetContract: assetContract,
+            assetId: assetId,
+            placedAt: block.timestamp
+        });
+
+        emit PlotPlaced(landId, plotId, kind, msg.sender, assetContract, assetId, paid);
+    }
+
+    /**
+     * @notice Clear a plot. Only the recorded `owner` or contract owner may clear.
+     *         Fees are non-refundable.
+     */
+    function clear(uint256 landId, uint256 plotId) external {
+        Land storage l = lands[landId];
+        require(l.exists, "land !exists");
+        require(plotId >= 1 && plotId <= l.plotCount, "plot OOB");
+
+        Placement storage p = placements[landId][plotId];
+        require(p.owner != address(0), "empty");
+        require(msg.sender == p.owner || msg.sender == owner(), "forbidden");
+
+        delete placements[landId][plotId];
+        emit PlotCleared(landId, plotId, msg.sender);
+    }
+
+    // -----------------------------
+    // Views
+    // -----------------------------
+
+    function getPlacement(uint256 landId, uint256 plotId) external view returns (Placement memory) {
+        return placements[landId][plotId];
+    }
+
+    // -----------------------------
+    // Internal
+    // -----------------------------
+
+    function _createLandInternal(uint256 plotCount) internal returns (uint256 landId) {
+        require(plotCount > 0, "zero plots");
+        landId = nextLandId++;
+        lands[landId] = Land({exists: true, plotCount: plotCount});
+        emit LandCreated(landId, plotCount);
+    }
+}
+
+
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+// OpenZeppelin v5.0.2 pinned imports for smooth Remix compilation.
+import {ERC721} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC721/ERC721.sol";
+import {Ownable} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/access/Ownable.sol";
+import {IERC20} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC20/utils/SafeERC20.sol";
+
+/**
+ * @dev Top-level interface (cannot be declared inside a contract in Solidity).
+ *      Matches the minimal HousingRegistry view used for permission checks.
+ */
+interface IRegistry {
+    function isAllowed(address venue, address integrator, uint256 requiredMask) external view returns (bool);
+}
+
+/**
+ * @title WorldGameHouses721
+ * @notice House NFTs:
+ *         - Mint as **2-bedroom** by default.
+ *         - Purchasable with **USDC or WGU** (both prices owner-updateable).
+ *         - **Upgrades**: increase bedrooms; paid in **WGU** (owner-updateable price per step).
+ *         - **Sellable only when empty** (no occupants and no reserved baby slot).
+ *         - Minimal residency counters and baby-slot reservation hooks.
+ *         - Optional integration with HousingRegistry via `isAllowed` checks.
+ *
+ * @dev Intentionally compact to compile/deploy immediately in Remix (no proxy here).
+ */
+contract WorldGameHouses721 is ERC721, Ownable {
+    using SafeERC20 for IERC20;
+
+    // Mirror HousingRegistry bit positions
+    uint256 private constant PERM_HOME_ASSIGN      = 1 << 0;
+    uint256 private constant PERM_HOME_VACATE      = 1 << 1;
+    uint256 private constant PERM_CAPACITY_RESERVE = 1 << 3;
+
+    // ---------------------------------------------------------------------
+    // Storage
+    // ---------------------------------------------------------------------
+    IERC20 public usdc;         // purchase currency (6 decimals typical)
+    IERC20 public wgu;          // in-game token (2 decimals)
+    address public treasury;    // fee sink
+
+    uint256 public housePriceUSDC = 1 * 1_000_000; // default 1 USDC
+    uint256 public housePriceWGU  = 1 * 100;       // default 1 WGU (2 decimals)
+    uint256 public upgradePriceWGUPerBedroom = 1 * 100; // 1 WGU per +1 bedroom
+
+    // Next token id
+    uint256 public nextId = 1;
+
+    // Bedrooms and occupancy
+    mapping(uint256 => uint256) public bedroomsOf;        // tokenId => bedrooms (capacity)
+    mapping(uint256 => uint256) public occupantsOf;       // tokenId => current occupant count
+    mapping(uint256 => bool)     public babySlotReserved; // tokenId => reserved (1) / not (0)
+
+    // Optional registry (can be zero)
+    IRegistry public housingRegistry;
+
+    // ---------------------------------------------------------------------
+    // Events
+    // ---------------------------------------------------------------------
+    event TreasuryUpdated(address indexed previous, address indexed current);
+    event USDCUpdated(address indexed previous, address indexed current);
+    event WGUUpdated(address indexed previous, address indexed current);
+    event PricesUpdated(uint256 housePriceUSDC, uint256 housePriceWGU, uint256 upgradePriceWGUPerBedroom);
+    event HouseMinted(address indexed to, uint256 indexed tokenId, uint256 bedrooms, bool paidWithUSDC);
+    event HouseUpgraded(uint256 indexed tokenId, uint256 fromBedrooms, uint256 toBedrooms, uint256 paidWGU);
+    event HomeAssigned(uint256 indexed tokenId, uint256 occupantsAfter);
+    event HomeVacated(uint256 indexed tokenId, uint256 occupantsAfter);
+    event BabySlotReserved(uint256 indexed tokenId, bool reserved);
+    event RegistryUpdated(address indexed registry);
+
+    // ---------------------------------------------------------------------
+    // Constructor
+    // ---------------------------------------------------------------------
+    constructor(
+        address initialOwner,
+        address usdcToken,
+        address wguToken,
+        address treasuryAddr
+    ) ERC721("WorldGameHouses", "WGH") Ownable(initialOwner) {
+        require(usdcToken != address(0) && wguToken != address(0) && treasuryAddr != address(0), "zero addr");
+        usdc = IERC20(usdcToken);
+        wgu = IERC20(wguToken);
+        treasury = treasuryAddr;
+    }
+
+    // ---------------------------------------------------------------------
+    // Admin
+    // ---------------------------------------------------------------------
+    function setTreasury(address newTreasury) external onlyOwner {
+        require(newTreasury != address(0), "zero addr");
+        address prev = treasury;
+        treasury = newTreasury;
+        emit TreasuryUpdated(prev, newTreasury);
+    }
+
+    function setUSDC(address newUSDC) external onlyOwner {
+        require(newUSDC != address(0), "zero addr");
+        address prev = address(usdc);
+        usdc = IERC20(newUSDC);
+        emit USDCUpdated(prev, newUSDC);
+    }
+
+    function setWGU(address newWGU) external onlyOwner {
+        require(newWGU != address(0), "zero addr");
+        address prev = address(wgu);
+        wgu = IERC20(newWGU);
+        emit WGUUpdated(prev, newWGU);
+    }
+
+    function setPrices(uint256 newHousePriceUSDC, uint256 newHousePriceWGU, uint256 newUpgradePriceWGUPerBedroom) external onlyOwner {
+        housePriceUSDC = newHousePriceUSDC;
+        housePriceWGU = newHousePriceWGU;
+        upgradePriceWGUPerBedroom = newUpgradePriceWGUPerBedroom;
+        emit PricesUpdated(housePriceUSDC, housePriceWGU, upgradePriceWGUPerBedroom);
+    }
+
+    function setRegistry(address registry) external onlyOwner {
+        housingRegistry = IRegistry(registry);
+        emit RegistryUpdated(registry);
+    }
+
+    // ---------------------------------------------------------------------
+    // Mint
+    // ---------------------------------------------------------------------
+
+    /**
+     * @notice Mint a new house NFT with 2 bedrooms.
+     * @param payWithUSDC If true, charge USDC; else charge WGU.
+     */
+    function mintHouse(bool payWithUSDC) external returns (uint256 tokenId) {
+        if (payWithUSDC) {
+            uint256 price = housePriceUSDC;
+            if (price > 0) usdc.safeTransferFrom(msg.sender, treasury, price);
+        } else {
+            uint256 price = housePriceWGU;
+            if (price > 0) wgu.safeTransferFrom(msg.sender, treasury, price);
+        }
+
+        tokenId = nextId++;
+        _safeMint(msg.sender, tokenId);
+        bedroomsOf[tokenId] = 2; // default
+        emit HouseMinted(msg.sender, tokenId, 2, payWithUSDC);
+    }
+
+    // ---------------------------------------------------------------------
+    // Upgrades
+    // ---------------------------------------------------------------------
+
+    /**
+     * @notice Upgrade house capacity (bedrooms). Pay WGU per +1 bedroom.
+     */
+    function upgradeHouse(uint256 tokenId, uint256 newBedrooms) external {
+        require(_ownerOf(tokenId) == msg.sender, "not owner");
+        require(newBedrooms > bedroomsOf[tokenId], "no increase");
+        uint256 steps = newBedrooms - bedroomsOf[tokenId];
+
+        uint256 cost = steps * upgradePriceWGUPerBedroom;
+        if (cost > 0) wgu.safeTransferFrom(msg.sender, treasury, cost);
+
+        uint256 prior = bedroomsOf[tokenId];
+        bedroomsOf[tokenId] = newBedrooms;
+        emit HouseUpgraded(tokenId, prior, newBedrooms, cost);
+    }
+
+    // ---------------------------------------------------------------------
+    // Residency
+    // ---------------------------------------------------------------------
+
+    modifier onlyHomeOp(uint256 tokenId, uint256 mask) {
+        // Allow owner of the house or contract owner by default
+        if (msg.sender == owner() || msg.sender == _ownerOf(tokenId)) {
+            _;
+            return;
+        }
+        // If registry is set, require explicit permission
+        IRegistry reg = housingRegistry;
+        require(address(reg) != address(0) && reg.isAllowed(address(this), msg.sender, mask), "forbidden");
+        _;
+    }
+
+    /**
+     * @notice Assign a resident (worker) to this house: increments occupancy.
+     *         Caller: house owner, contract owner, or registry-approved integrator.
+     */
+    function homeAssign(uint256 tokenId) external onlyHomeOp(tokenId, PERM_HOME_ASSIGN) {
+        require(_ownerOf(tokenId) != address(0), "no such house");
+        uint256 capacity = bedroomsOf[tokenId];
+        uint256 occ = occupantsOf[tokenId];
+        require(occ < capacity, "full");
+        occupantsOf[tokenId] = occ + 1;
+        emit HomeAssigned(tokenId, occ + 1);
+    }
+
+    /**
+     * @notice Vacate a resident from this house: decrements occupancy.
+     *         Caller: house owner, contract owner, or registry-approved integrator.
+     */
+    function homeVacate(uint256 tokenId) external onlyHomeOp(tokenId, PERM_HOME_VACATE) {
+        uint256 occ = occupantsOf[tokenId];
+        require(occ > 0, "empty");
+        occupantsOf[tokenId] = occ - 1;
+        emit HomeVacated(tokenId, occ - 1);
+    }
+
+    /**
+     * @notice Reserve or release a baby slot for pregnancy attempts.
+     *         Caller: house owner, contract owner, or registry-approved integrator.
+     */
+    function setBabySlotReserved(uint256 tokenId, bool reserved) external onlyHomeOp(tokenId, PERM_CAPACITY_RESERVE) {
+        require(_ownerOf(tokenId) != address(0), "no such house");
+        if (reserved) {
+            // ensure capacity allows reservation (one slot)
+            require(occupantsOf[tokenId] + 1 <= bedroomsOf[tokenId], "no capacity");
+            babySlotReserved[tokenId] = true;
+        } else {
+            babySlotReserved[tokenId] = false;
+        }
+        emit BabySlotReserved(tokenId, reserved);
+    }
+
+    // ---------------------------------------------------------------------
+    // Transfer guard: houses are sellable/transferable only when empty
+    // ---------------------------------------------------------------------
+
+    function _update(address to, uint256 tokenId, address auth) internal override returns (address) {
+        address from = _ownerOf(tokenId);
+        if (from != address(0) && to != from) {
+            // On transfer, require no occupants and no reserved baby slot
+            require(occupantsOf[tokenId] == 0 && !babySlotReserved[tokenId], "house not empty");
+        }
+        return super._update(to, tokenId, auth);
+    }
+}
+
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import {Ownable} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/access/Ownable.sol";
+import {IERC721} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC721/IERC721.sol";
+
+/**
+ * @dev Minimal interfaces for the specific functions we need.
+ */
+interface IWorkers is IERC721 {
+    function genderOf(uint256 tokenId) external view returns (uint8);
+    function mintBaby(address to) external returns (uint256);
+}
+
+interface IHouses is IERC721 {
+    function babySlotReserved(uint256 tokenId) external view returns (bool);
+}
+
+interface IERC1155Burnable {
+    function burn(address account, uint256 id, uint256 value) external;
+}
+
+/**
+ * @title ReproductionManager (stack-optimized)
+ * @notice Handles pregnancy attempts for worker NFTs with minimal locals to avoid
+ *         "stack too deep" in Remix w/o via-IR.
+ */
+contract ReproductionManager is Ownable {
+    uint256 public constant BPS_DENOMINATOR = 10_000;
+    uint256 public successRateBps = 3_500;        // 35%
+    uint256 public successCooldownSec = 30 days;  // success → 30d
+    uint256 public failureCooldownSec = 15 days;  // fail → 15d
+
+    IERC1155Burnable public pillToken;
+    uint256 public pillId = 1;
+    uint256 public pillPerAttempt = 1;
+
+    IWorkers public workers;
+    IHouses public houses;
+
+    mapping(bytes32 => uint256) public nextEligibleAt;
+
+    event ParamsUpdated(uint256 successRateBps, uint256 successCooldownSec, uint256 failureCooldownSec);
+    event PillConfigUpdated(address pillToken, uint256 pillId, uint256 pillPerAttempt);
+    event ContractsUpdated(address workers, address houses);
+    event PregnancyAttempted(
+        address indexed owner,
+        uint256 indexed motherId,
+        uint256 indexed fatherId,
+        uint256 houseId,
+        bool success,
+        uint256 babyTokenId,
+        uint256 nextEligibleAt
+    );
+
+    constructor(address initialOwner) Ownable(initialOwner) {}
+
+    // ---------------- Admin ----------------
+
+    function setParams(uint256 _successRateBps, uint256 _successCooldownSec, uint256 _failureCooldownSec) external onlyOwner {
+        require(_successRateBps <= BPS_DENOMINATOR, "bps>100%");
+        successRateBps = _successRateBps;
+        successCooldownSec = _successCooldownSec;
+        failureCooldownSec = _failureCooldownSec;
+        emit ParamsUpdated(successRateBps, successCooldownSec, failureCooldownSec);
+    }
+
+    function setPillConfig(IERC1155Burnable _pillToken, uint256 _pillId, uint256 _pillPerAttempt) external onlyOwner {
+        pillToken = _pillToken;
+        pillId = _pillId;
+        pillPerAttempt = _pillPerAttempt;
+        emit PillConfigUpdated(address(_pillToken), _pillId, _pillPerAttempt);
+    }
+
+    function setContracts(IWorkers _workers, IHouses _houses) external onlyOwner {
+        workers = _workers;
+        houses = _houses;
+        emit ContractsUpdated(address(_workers), address(_houses));
+    }
+
+    // ---------------- Core ----------------
+
+    function attempt(uint256 motherId, uint256 fatherId, uint256 houseId) external returns (bool success, uint256 babyId) {
+        require(address(workers) != address(0) && address(houses) != address(0), "contracts unset");
+        require(motherId != fatherId, "same parent");
+        require(workers.ownerOf(motherId) == msg.sender && workers.ownerOf(fatherId) == msg.sender && houses.ownerOf(houseId) == msg.sender, "not owner");
+
+        // Gender M+F check without extra locals
+        require(_hasMaleAndFemale(workers.genderOf(motherId), workers.genderOf(fatherId)), "needs M+F");
+
+        // Capacity reservation
+        require(houses.babySlotReserved(houseId), "reserve baby slot");
+
+        bytes32 key = _pairKey(motherId, fatherId, houseId);
+        require(block.timestamp >= nextEligibleAt[key], "cooldown");
+
+        // Burn pill(s)
+        if (address(pillToken) != address(0) && pillPerAttempt > 0) {
+            pillToken.burn(msg.sender, pillId, pillPerAttempt);
+        }
+
+        // Random roll moved to helper to avoid locals
+        if (_randSuccess(motherId, fatherId, houseId)) {
+            success = true;
+            babyId = workers.mintBaby(msg.sender);
+            nextEligibleAt[key] = block.timestamp + successCooldownSec;
+        } else {
+            nextEligibleAt[key] = block.timestamp + failureCooldownSec;
+        }
+
+        emit PregnancyAttempted(msg.sender, motherId, fatherId, houseId, success, babyId, nextEligibleAt[key]);
+    }
+
+    function nextAttemptTime(uint256 motherId, uint256 fatherId, uint256 houseId) external view returns (uint256) {
+        return nextEligibleAt[_pairKey(motherId, fatherId, houseId)];
+    }
+
+    // ------------- Internals (stack relief) -------------
+
+    function _pairKey(uint256 a, uint256 b, uint256 houseId) internal pure returns (bytes32) {
+        return (a < b)
+            ? keccak256(abi.encodePacked(a, b, houseId))
+            : keccak256(abi.encodePacked(b, a, houseId));
+    }
+
+    function _hasMaleAndFemale(uint8 a, uint8 b) internal pure returns (bool) {
+        bool hasMale = (a == 1) || (b == 1);
+        bool hasFemale = (a == 2) || (b == 2);
+        return hasMale && hasFemale;
+    }
+
+    function _randSuccess(uint256 motherId, uint256 fatherId, uint256 houseId) internal view returns (bool) {
+        uint256 r = uint256(keccak256(abi.encodePacked(
+            blockhash(block.number - 1),
+            msg.sender,
+            motherId,
+            fatherId,
+            houseId,
+            block.timestamp
+        )));
+        return (r % BPS_DENOMINATOR) < successRateBps;
+    }
+}
+
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+// OpenZeppelin v5.0.2 pinned imports for clean Remix compilation.
+import {Ownable} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/access/Ownable.sol";
+import {IERC20} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC20/utils/SafeERC20.sol";
+
+/**
+ * @dev Minimal interface for WGF minting (this contract must hold MINTER_ROLE on WGF).
+ */
+interface IWGF {
+    function mint(address to, uint256 amount) external;
+}
+
+/**
+ * @title FoodShop
+ * @notice Sells WorldGameFood (WGF, 0 decimals) in exchange for WorldGameUsd (WGU, 2 decimals).
+ *         - Price is set in **WGU base units per 1 WGF** (default: 100 = 1.00 WGU per 1 WGF).
+ *         - On purchase, transfers WGU from buyer to **Treasury** and **mints** WGF to buyer.
+ *         - Admin can update tokens, Treasury, and price.
+ *
+ * @dev Keep it tiny to avoid stack-too-deep; expects this contract to have MINTER_ROLE on WGF.
+ */
+contract FoodShop is Ownable {
+    using SafeERC20 for IERC20;
+
+    IERC20 public wgu;      // payment token (2 decimals)
+    IWGF   public wgf;      // food token (0 decimals, mintable by this if granted)
+    address public treasury;
+
+    // Price in WGU's smallest units per 1 WGF. Default 100 = 1.00 WGU.
+    uint256 public pricePerWGF = 100;
+
+    // -------------------- Events --------------------
+    event TreasuryUpdated(address indexed previous, address indexed current);
+    event TokensUpdated(address indexed wgu, address indexed wgf);
+    event PriceUpdated(uint256 previousPrice, uint256 newPrice);
+    event Bought(address indexed buyer, uint256 qtyWGF, uint256 costWGU);
+
+    // -------------------- Constructor --------------------
+    constructor(address initialOwner, address wguToken, address wgfToken, address treasuryAddr)
+        Ownable(initialOwner)
+    {
+        require(wguToken != address(0) && wgfToken != address(0) && treasuryAddr != address(0), "zero addr");
+        wgu = IERC20(wguToken);
+        wgf = IWGF(wgfToken);
+        treasury = treasuryAddr;
+    }
+
+    // -------------------- Admin --------------------
+    function setTreasury(address newTreasury) external onlyOwner {
+        require(newTreasury != address(0), "zero addr");
+        address prev = treasury;
+        treasury = newTreasury;
+        emit TreasuryUpdated(prev, newTreasury);
+    }
+
+    function setTokens(address wguToken, address wgfToken) external onlyOwner {
+        require(wguToken != address(0) && wgfToken != address(0), "zero addr");
+        wgu = IERC20(wguToken);
+        wgf = IWGF(wgfToken);
+        emit TokensUpdated(wguToken, wgfToken);
+    }
+
+    function setPricePerWGF(uint256 newPrice) external onlyOwner {
+        uint256 prev = pricePerWGF;
+        pricePerWGF = newPrice;
+        emit PriceUpdated(prev, newPrice);
+    }
+
+    // -------------------- Buy --------------------
+    /**
+     * @notice Buy `qtyWGF` food units. Cost = qtyWGF * pricePerWGF (in WGU base units).
+     *         Caller must approve this contract to spend WGU before calling.
+     *         This contract must have MINTER_ROLE on WGF to mint to buyer.
+     */
+    function buy(uint256 qtyWGF) external {
+        require(qtyWGF > 0, "qty=0");
+        uint256 cost = qtyWGF * pricePerWGF;
+
+        // Pull WGU from buyer straight to Treasury.
+        if (cost > 0) {
+            wgu.safeTransferFrom(msg.sender, treasury, cost);
+        }
+
+        // Mint WGF to buyer.
+        wgf.mint(msg.sender, qtyWGF);
+
+        emit Bought(msg.sender, qtyWGF, cost);
+    }
+
+    // -------------------- Rescue --------------------
+    function rescueERC20(IERC20 token, uint256 amount, address to) external onlyOwner {
+        require(address(token) != address(0) && to != address(0), "zero addr");
+        if (amount > 0) token.safeTransfer(to, amount);
+    }
+}
+
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+// OpenZeppelin v5.0.2 pinned imports for clean Remix compilation.
+import {Ownable} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/access/Ownable.sol";
+import {IERC20} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IERC721} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC721/IERC721.sol";
+
+/**
+ * @dev Optional prereq/XP/meal interfaces to keep this venue generic.
+ */
+interface IWorkPrereq {
+    function isEligible(uint256 workerId) external view returns (bool);
+}
+
+interface IXpSink {
+    function awardXp(uint256 workerId, uint256 amount) external;
+}
+
+interface IMealChecker {
+    function hasActiveMeal(uint256 workerId) external view returns (bool);
+}
+
+/**
+ * @dev Minimal interface for WGU mint without importing custom token.
+ *      This contract must be granted MINTER_ROLE on the WGU token.
+ */
+interface IMinMint {
+    function mint(address to, uint256 amount) external;
+}
+
+/**
+ * @title WorkVenue
+ * @notice Generic workplace running fixed 10h shifts:
+ *         - Start work: checks ownerOf(worker), capacity, optional prereq + meal.
+ *         - End work: anyone can settle after 10h; pays WGU wage to current owner;
+ *           optionally calls an external XP sink.
+ *         - Default capacity = 5, wage = 1.00 WGU, xp = 1 (all owner-updateable).
+ *
+ * @dev Keep it tiny and IR-free for smooth Remix deployment.
+ *      This contract must have MINTER_ROLE on WGU if using mint-on-settle pattern.
+ */
+contract WorkVenue is Ownable {
+    using SafeERC20 for IERC20;
+
+    // ---------------- Constants ----------------
+    uint256 public constant SHIFT_SECONDS = 10 hours;
+
+    // ---------------- External contracts ----------------
+    IERC721 public workers;  // WorldGameWorkers721 (for ownerOf)
+    IERC20  public wgu;      // WorldGameUsd (2 decimals, AccessControl MINTER_ROLE expected)
+    IXpSink public xpSink;   // optional external XP sink
+    IWorkPrereq public prereq;       // optional eligibility checker
+    IMealChecker public mealChecker;  // optional meal status checker
+
+    // ---------------- Config ----------------
+    uint256 public capacity = 5;     // concurrent workers
+    uint256 public wageWGU = 100;    // 1.00 WGU per shift (2 decimals)
+    uint256 public xpPerShift = 1;   // XP units to award per completed shift
+
+    // ---------------- State ----------------
+    mapping(uint256 => uint256) public endTimeOf; // workerId => end timestamp (0 if idle)
+    uint256 public activeCount;
+
+    // ---------------- Events ----------------
+    event TokensUpdated(address indexed workers, address indexed wgu);
+    event IntegrationsUpdated(address indexed prereq, address indexed mealChecker, address indexed xpSink);
+    event ConfigUpdated(uint256 capacity, uint256 wageWGU, uint256 xpPerShift);
+    event WorkStarted(uint256 indexed workerId, address indexed owner, uint256 startTime, uint256 endTime);
+    event WorkEnded(uint256 indexed workerId, address indexed owner, uint256 endTime, uint256 wageWGU, uint256 xpAwarded);
+
+    // ---------------- Constructor ----------------
+    constructor(address initialOwner, address workers721, address wguToken) Ownable(initialOwner) {
+        require(workers721 != address(0) && wguToken != address(0), "zero addr");
+        workers = IERC721(workers721);
+        wgu = IERC20(wguToken);
+    }
+
+    // ---------------- Admin ----------------
+    function setTokens(address workers721, address wguToken) external onlyOwner {
+        require(workers721 != address(0) && wguToken != address(0), "zero addr");
+        workers = IERC721(workers721);
+        wgu = IERC20(wguToken);
+        emit TokensUpdated(workers721, wguToken);
+    }
+
+    function setIntegrations(address prereq_, address mealChecker_, address xpSink_) external onlyOwner {
+        prereq = IWorkPrereq(prereq_);
+        mealChecker = IMealChecker(mealChecker_);
+        xpSink = IXpSink(xpSink_);
+        emit IntegrationsUpdated(prereq_, mealChecker_, xpSink_);
+    }
+
+    function setConfig(uint256 capacity_, uint256 wageWGU_, uint256 xpPerShift_) external onlyOwner {
+        require(capacity_ > 0, "capacity=0");
+        capacity = capacity_;
+        wageWGU = wageWGU_;
+        xpPerShift = xpPerShift_;
+        emit ConfigUpdated(capacity, wageWGU, xpPerShift);
+    }
+
+    // ---------------- Core ----------------
+
+    /**
+     * @notice Start a 10-hour work session for `workerId`.
+     *         Caller must be current owner of the worker.
+     *         Optional checks: prereq.isEligible(workerId), mealChecker.hasActiveMeal(workerId).
+     */
+    function startWork(uint256 workerId) external {
+        require(endTimeOf[workerId] == 0, "already working");
+        require(workers.ownerOf(workerId) == msg.sender, "not owner");
+        require(activeCount < capacity, "no slots");
+
+        // Prereq (if configured)
+        IWorkPrereq p = prereq;
+        if (address(p) != address(0)) {
+            require(p.isEligible(workerId), "prereq fail");
+        }
+
+        // Meal check (if configured)
+        IMealChecker m = mealChecker;
+        if (address(m) != address(0)) {
+            require(m.hasActiveMeal(workerId), "no active meal");
+        }
+
+        uint256 endTs = block.timestamp + SHIFT_SECONDS;
+        endTimeOf[workerId] = endTs;
+        unchecked { activeCount += 1; }
+
+        emit WorkStarted(workerId, msg.sender, endTs - SHIFT_SECONDS, endTs);
+    }
+
+    /**
+     * @notice End the session for `workerId` after end time; pays wage and (optionally) awards XP.
+     *         Anyone can call once the shift is over (pays the current owner).
+     */
+    function endWork(uint256 workerId) external {
+        uint256 endTs = endTimeOf[workerId];
+        require(endTs != 0, "not working");
+        require(block.timestamp >= endTs, "too early");
+
+        // Clear state first to avoid reentrancy-like issues
+        endTimeOf[workerId] = 0;
+        unchecked { activeCount -= 1; }
+
+        address to = workers.ownerOf(workerId);
+
+        // Mint WGU wage to current owner (this contract must have MINTER_ROLE on WGU).
+        uint256 wage = wageWGU;
+        if (wage > 0) {
+            IMinMint(address(wgu)).mint(to, wage);
+        }
+
+        // Award XP via optional sink
+        uint256 xp = xpPerShift;
+        IXpSink sink = xpSink;
+        if (xp > 0 && address(sink) != address(0)) {
+            sink.awardXp(workerId, xp);
+        }
+
+        emit WorkEnded(workerId, to, endTs, wage, xp);
+    }
+}
+
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+// OpenZeppelin v5.0.2 pinned imports for clean Remix compilation.
+import {Ownable} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/access/Ownable.sol";
+import {IERC20} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IERC721} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC721/IERC721.sol";
+
+/**
+ * @dev Optional prerequisite interface: owner can set a contract that validates
+ *      whether a worker is eligible to enroll in this venue.
+ */
+interface IEduPrereq {
+    function isEligible(uint256 workerId) external view returns (bool);
+}
+
+/**
+ * @title EducationVenue
+ * @notice Generic school/education venue running fixed 10h sessions:
+ *         - Start study: checks ownerOf(worker) and optional prerequisite.
+ *         - End study: anyone can settle after 10h and marks completion.
+ *         - Fees: owner-settable per venue in USDC and/or WGU (Elementary can be free).
+ *         - Unlimited capacity by design.
+ */
+contract EducationVenue is Ownable {
+    using SafeERC20 for IERC20;
+
+    // ---------------- Constants ----------------
+    uint256 public constant SESSION_SECONDS = 10 hours;
+
+    // ---------------- External contracts ----------------
+    IERC721 public workers;  // WorldGameWorkers721 (ownerOf checks)
+    IERC20  public usdc;     // USDC (6 decimals typical) optional
+    IERC20  public wgu;      // WorldGameUsd (2 decimals) optional
+    address public treasury; // fee sink
+
+    IEduPrereq public prereq; // optional prerequisite checker
+
+    // ---------------- Fees ----------------
+    uint256 public feeUSDC = 0;  // default free
+    uint256 public feeWGU  = 0;  // default free
+
+    // ---------------- State ----------------
+    mapping(uint256 => uint256) public endTimeOf;    // workerId => end timestamp (0 if idle)
+    mapping(uint256 => bool)    public completed;    // workerId => has completed this venue
+
+    // ---------------- Events ----------------
+    event TokensUpdated(address indexed workers, address indexed usdc, address indexed wgu);
+    event TreasuryUpdated(address indexed previous, address indexed current);
+    event PrereqUpdated(address indexed prereq);
+    event FeesUpdated(uint256 feeUSDC, uint256 feeWGU);
+    event StudyStarted(uint256 indexed workerId, address indexed owner, uint256 startTime, uint256 endTime);
+    event StudyEnded(uint256 indexed workerId, address indexed owner, uint256 endTime, bool completedNow);
+
+    // ---------------- Constructor ----------------
+    constructor(
+        address initialOwner,
+        address workers721,
+        address usdcToken,
+        address wguToken,
+        address treasuryAddr
+    ) Ownable(initialOwner) {
+        require(workers721 != address(0) && treasuryAddr != address(0), "zero addr");
+        workers = IERC721(workers721);
+        usdc = IERC20(usdcToken);
+        wgu = IERC20(wguToken);
+        treasury = treasuryAddr;
+    }
+
+    // ---------------- Admin ----------------
+    function setTokens(address workers721, address usdcToken, address wguToken) external onlyOwner {
+        require(workers721 != address(0), "zero workers");
+        workers = IERC721(workers721);
+        usdc = IERC20(usdcToken);
+        wgu = IERC20(wguToken);
+        emit TokensUpdated(workers721, usdcToken, wguToken);
+    }
+
+    function setTreasury(address newTreasury) external onlyOwner {
+        require(newTreasury != address(0), "zero addr");
+        address prev = treasury;
+        treasury = newTreasury;
+        emit TreasuryUpdated(prev, newTreasury);
+    }
+
+    function setPrereq(address prereq_) external onlyOwner {
+        prereq = IEduPrereq(prereq_);
+        emit PrereqUpdated(prereq_);
+    }
+
+    function setFees(uint256 feeUSDC_, uint256 feeWGU_) external onlyOwner {
+        feeUSDC = feeUSDC_;
+        feeWGU  = feeWGU_;
+        emit FeesUpdated(feeUSDC, feeWGU);
+    }
+
+    // ---------------- Core ----------------
+
+    /**
+     * @notice Start a 10-hour study session for `workerId`.
+     *         Caller must be current owner. Optional prereq is enforced if set.
+     *         Fees (if any) are charged up-front to Treasury.
+     */
+    function startStudy(uint256 workerId) external {
+        require(endTimeOf[workerId] == 0, "already studying");
+        require(workers.ownerOf(workerId) == msg.sender, "not owner");
+
+        IEduPrereq p = prereq;
+        if (address(p) != address(0)) {
+            require(p.isEligible(workerId), "prereq fail");
+        }
+
+        // Charge fees up-front (if configured)
+        uint256 u = feeUSDC;
+        if (u > 0) {
+            IERC20(usdc).safeTransferFrom(msg.sender, treasury, u);
+        }
+        uint256 g = feeWGU;
+        if (g > 0) {
+            IERC20(wgu).safeTransferFrom(msg.sender, treasury, g);
+        }
+
+        uint256 endTs = block.timestamp + SESSION_SECONDS;
+        endTimeOf[workerId] = endTs;
+
+        emit StudyStarted(workerId, msg.sender, endTs - SESSION_SECONDS, endTs);
+    }
+
+    /**
+     * @notice End the session for `workerId` after end time; marks completion.
+     *         Anyone can call once the session is over.
+     */
+    function endStudy(uint256 workerId) external {
+        uint256 endTs = endTimeOf[workerId];
+        require(endTs != 0, "not studying");
+        require(block.timestamp >= endTs, "too early");
+
+        endTimeOf[workerId] = 0;
+
+        address ownerNow = workers.ownerOf(workerId);
+        bool newly = !completed[workerId];
+        if (newly) {
+            completed[workerId] = true;
+        }
+
+        emit StudyEnded(workerId, ownerNow, endTs, newly);
+    }
+}
+
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+// OpenZeppelin v5.0.2 pinned imports for clean Remix compilation.
+import {Ownable} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/access/Ownable.sol";
+import {IERC20} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IERC721} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC721/IERC721.sol";
+
+/**
+ * @dev Minimal interface for ERC20Burnable.burn(uint256).
+ */
+interface IEGFBurn {
+    function burn(uint256 amount) external;
+}
+
+/**
+ * @dev Optional checker interface used by WorkVenue.
+ */
+interface IMealChecker {
+    function hasActiveMeal(uint256 workerId) external view returns (bool);
+}
+
+/**
+ * @title MealManager
+ * @notice Burns WGF food to grant a 10-hour "active meal" for a worker NFT.
+ *         - Default cost: 100 WGF per refuel (owner-updateable).
+ *         - Duration: 10 hours (owner-updateable).
+ *         - Enforces: caller must own BOTH the worker and the chosen house (home refuel).
+ *         - Exposes `hasActiveMeal(workerId)` for workplaces.
+ */
+contract MealManager is Ownable, IMealChecker {
+    using SafeERC20 for IERC20;
+
+    // ---------------- External contracts ----------------
+    IERC721 public workers;  // WorldGameWorkers721
+    IERC721 public houses;   // WorldGameHouses721
+    IERC20  public wgf;      // WorldGameFood (0 decimals, Burnable)
+
+    // ---------------- Config ----------------
+    uint256 public mealCostWGF = 100;     // default: 100 WGF per refuel
+    uint256 public mealDuration = 10 hours; // default: 10 hours per refuel
+
+    // ---------------- State ----------------
+    mapping(uint256 => uint256) public mealEndTime; // workerId => unix timestamp (0 if none)
+
+    // ---------------- Events ----------------
+    event TokensUpdated(address indexed workers, address indexed houses, address indexed wgf);
+    event ConfigUpdated(uint256 mealCostWGF, uint256 mealDuration);
+    event Refueled(address indexed by, uint256 indexed workerId, uint256 indexed houseId, uint256 costWGF, uint256 newMealEndTime);
+
+    // ---------------- Constructor ----------------
+    constructor(address initialOwner, address workers721, address houses721, address wgfToken) Ownable(initialOwner) {
+        require(workers721 != address(0) && houses721 != address(0) && wgfToken != address(0), "zero addr");
+        workers = IERC721(workers721);
+        houses = IERC721(houses721);
+        wgf = IERC20(wgfToken);
+    }
+
+    // ---------------- Admin ----------------
+    function setTokens(address workers721, address houses721, address wgfToken) external onlyOwner {
+        require(workers721 != address(0) && houses721 != address(0) && wgfToken != address(0), "zero addr");
+        workers = IERC721(workers721);
+        houses = IERC721(houses721);
+        wgf = IERC20(wgfToken);
+        emit TokensUpdated(workers721, houses721, wgfToken);
+    }
+
+    function setConfig(uint256 mealCostWGF_, uint256 mealDuration_) external onlyOwner {
+        require(mealDuration_ > 0, "duration=0");
+        mealCostWGF = mealCostWGF_;
+        mealDuration = mealDuration_;
+        emit ConfigUpdated(mealCostWGF, mealDuration);
+    }
+
+    // ---------------- Core ----------------
+
+    /**
+     * @notice Refuel at home: burns `mealCostWGF` from caller to grant `mealDuration` to worker.
+     *         Requirements:
+     *           - Caller owns `workerId` AND `houseId` (home gating).
+     *           - Caller approved this contract to transfer WGF (or pre-sent WGF to this contract).
+     *         Mechanics:
+     *           - Pull WGF from caller to this contract (if cost>0) and burn it.
+     *           - Sets worker's meal end time to now + `mealDuration` (resets if already active).
+     */
+    function refuel(uint256 workerId, uint256 houseId) external {
+        require(workers.ownerOf(workerId) == msg.sender, "not worker owner");
+        require(houses.ownerOf(houseId) == msg.sender, "not house owner");
+
+        uint256 cost = mealCostWGF;
+        if (cost > 0) {
+            wgf.safeTransferFrom(msg.sender, address(this), cost);
+            IEGFBurn(address(wgf)).burn(cost);
+        }
+
+        uint256 newEnd = block.timestamp + mealDuration;
+        mealEndTime[workerId] = newEnd;
+
+        emit Refueled(msg.sender, workerId, houseId, cost, newEnd);
+    }
+
+    /// @inheritdoc IMealChecker
+    function hasActiveMeal(uint256 workerId) external view returns (bool) {
+        return block.timestamp < mealEndTime[workerId];
+    }
+
+    function remainingMeal(uint256 workerId) external view returns (uint256) {
+        uint256 end = mealEndTime[workerId];
+        if (end <= block.timestamp) return 0;
+        return end - block.timestamp;
+    }
+
+    // ---------------- Rescue ----------------
+    function rescueERC20(IERC20 token, uint256 amount, address to) external onlyOwner {
+        require(address(token) != address(0) && to != address(0), "zero addr");
+        if (amount > 0) token.safeTransfer(to, amount);
+    }
+}
+
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import {Ownable} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/access/Ownable.sol";
+
+/**
+ * @title XpTracker
+ * @notice Minimal XP ledger for worker NFTs:
+ *         - Whitelisted callers (e.g., WorkVenue) can `awardXp(workerId, amount)`.
+ *         - Owner configures 4-tier level thresholds: [L1, L2, L3] mapping XP → levels 0..3.
+ *           Example (defaults): 0–10 → L0, 11–50 → L1, 51–200 → L2, 201+ → L3.
+ *         - Read helpers: `xpOf(id)` and `levelOf(id)`.
+ */
+contract XpTracker is Ownable {
+    // ---------------- Storage ----------------
+    mapping(uint256 => uint256) public xpOf;   // workerId => total XP
+    mapping(address => bool)    public isCaller; // whitelist for awarders (venues/integrators)
+
+    // Level thresholds (inclusive upper bounds for L0..L2; L3 is above L2)
+    uint256 public lvl1Max = 10;   // XP <= 10 -> Level 0
+    uint256 public lvl2Max = 50;   // 11..50 -> Level 1
+    uint256 public lvl3Max = 200;  // 51..200 -> Level 2 ; >200 -> Level 3
+
+    // ---------------- Events ----------------
+    event CallerSet(address indexed caller, bool isAllowed);
+    event ThresholdsSet(uint256 lvl1Max, uint256 lvl2Max, uint256 lvl3Max);
+    event XpAwarded(uint256 indexed workerId, uint256 amount, uint256 newTotal);
+
+    // ---------------- Constructor ----------------
+    constructor(address initialOwner) Ownable(initialOwner) {}
+
+    // ---------------- Admin ----------------
+    function setCaller(address caller, bool allowed) external onlyOwner {
+        isCaller[caller] = allowed;
+        emit CallerSet(caller, allowed);
+    }
+
+    function setThresholds(uint256 _lvl1Max, uint256 _lvl2Max, uint256 _lvl3Max) external onlyOwner {
+        require(_lvl1Max > 0 && _lvl1Max < _lvl2Max && _lvl2Max < _lvl3Max, "bad thresholds");
+        lvl1Max = _lvl1Max;
+        lvl2Max = _lvl2Max;
+        lvl3Max = _lvl3Max;
+        emit ThresholdsSet(lvl1Max, lvl2Max, lvl3Max);
+    }
+
+    // ---------------- Core ----------------
+    /**
+     * @notice Award `amount` XP to `workerId`. Callable only by whitelisted venues.
+     */
+    function awardXp(uint256 workerId, uint256 amount) external {
+        require(isCaller[msg.sender], "not allowed");
+        if (amount == 0) return;
+        uint256 total = xpOf[workerId] + amount;
+        xpOf[workerId] = total;
+        emit XpAwarded(workerId, amount, total);
+    }
+
+    /**
+     * @notice Return level 0..3 derived from current XP and thresholds.
+     */
+    function levelOf(uint256 workerId) external view returns (uint8) {
+        uint256 x = xpOf[workerId];
+        if (x <= lvl1Max) return 0;
+        if (x <= lvl2Max) return 1;
+        if (x <= lvl3Max) return 2;
+        return 3;
+    }
+}
+
+
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+// OpenZeppelin v5.0.2 pinned import (for Ownable)
+import {Ownable} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/access/Ownable.sol";
+
+/* ========= Top-level interfaces (NOT inside a contract) ========= */
+
+// Minimal interface to your Houses NFT (WorldGameHouses721)
+interface IHouses {
+    function ownerOf(uint256 tokenId) external view returns (address);
+    function bedroomsOf(uint256 tokenId) external view returns (uint256);
+    function occupantsOf(uint256 tokenId) external view returns (uint256);
+    function babySlotReserved(uint256 tokenId) external view returns (bool);
+    function homeAssign(uint256 tokenId) external;
+    function homeVacate(uint256 tokenId) external;
+}
+
+// Minimal interface to your Workers NFT (WorldGameWorkers721)
+interface IWorkers {
+    // 1 = Male, 2 = Female
+    function genderOf(uint256 tokenId) external view returns (uint8);
+    function ownerOf(uint256 tokenId) external view returns (address);
+}
+
+/* ======================= OccupancyRegistry ======================= */
+/**
+ * @title OccupancyRegistry
+ * @notice Records which Worker NFTs live in which House NFTs.
+ *         - Verifies ownership of both house and worker.
+ *         - Enforces capacity from Houses (bedrooms).
+ *         - Enforces a simple pair rule: at most one of each gender.
+ *         - Calls Houses.homeAssign/homeVacate to keep counters in sync.
+ */
+contract OccupancyRegistry is Ownable {
+    IHouses public houses;
+    IWorkers public workers;
+
+    // houseId => array of workerIds living there
+    mapping(uint256 => uint256[]) private _occupants;
+
+    // workerId => current houseId (0 if none)
+    mapping(uint256 => uint256) private _housedAt;
+
+    event Linked(address indexed houses, address indexed workers);
+    event WorkerAssigned(uint256 indexed houseId, uint256 indexed workerId, uint8 gender);
+    event WorkerVacated(uint256 indexed houseId, uint256 indexed workerId);
+
+    constructor(address initialOwner, address housesAddr, address workersAddr)
+        Ownable(initialOwner)
+    {
+        require(housesAddr != address(0) && workersAddr != address(0), "zero addr");
+        houses = IHouses(housesAddr);
+        workers = IWorkers(workersAddr);
+        emit Linked(housesAddr, workersAddr);
+    }
+
+    /* ------------------------ Admin ------------------------ */
+    function setContracts(address housesAddr, address workersAddr) external onlyOwner {
+        require(housesAddr != address(0) && workersAddr != address(0), "zero addr");
+        houses = IHouses(housesAddr);
+        workers = IWorkers(workersAddr);
+        emit Linked(housesAddr, workersAddr);
+    }
+
+    /* ------------------------ Core ------------------------- */
+
+    /**
+     * @notice Assign a worker to a house.
+     * Requirements:
+     *  - msg.sender owns the house AND the worker (same wallet).
+     *  - house capacity (bedrooms) not exceeded.
+     *  - At most one of each gender (1 male, 1 female).
+     * Effects:
+     *  - Records worker in house.
+     *  - Calls houses.homeAssign(houseId) to bump the counter.
+     */
+    function assign(uint256 houseId, uint256 workerId) external {
+        require(houses.ownerOf(houseId) == msg.sender, "not house owner");
+        require(workers.ownerOf(workerId) == msg.sender, "not worker owner");
+        require(_housedAt[workerId] == 0, "already housed");
+
+        uint256 capacity = houses.bedroomsOf(houseId);
+        uint256 occCount = _occupants[houseId].length;
+        require(occCount < capacity, "house full");
+
+        uint8 g = workers.genderOf(workerId);
+        require(g == 1 || g == 2, "invalid gender");
+
+        // Enforce simple pair rule: no duplicate gender already inside
+        for (uint256 i = 0; i < occCount; i++) {
+            uint8 g2 = workers.genderOf(_occupants[houseId][i]);
+            require(g2 != g, "same gender present");
+        }
+
+        _occupants[houseId].push(workerId);
+        _housedAt[workerId] = houseId;
+
+        houses.homeAssign(houseId);
+        emit WorkerAssigned(houseId, workerId, g);
+    }
+
+    /**
+     * @notice Vacate a worker from whichever house it currently lives in.
+     * Requirements:
+     *  - Worker is housed.
+     *  - msg.sender is BOTH the current worker owner and the house owner (keeps state consistent if one was transferred).
+     */
+    function vacate(uint256 workerId) external {
+        uint256 houseId = _housedAt[workerId];
+        require(houseId != 0, "not housed");
+
+        require(workers.ownerOf(workerId) == msg.sender, "not worker owner");
+        require(houses.ownerOf(houseId) == msg.sender, "not house owner");
+
+        // remove from occupants array (swap & pop)
+        uint256[] storage arr = _occupants[houseId];
+        for (uint256 i = 0; i < arr.length; i++) {
+            if (arr[i] == workerId) {
+                arr[i] = arr[arr.length - 1];
+                arr.pop();
+                break;
+            }
+        }
+        _housedAt[workerId] = 0;
+
+        houses.homeVacate(houseId);
+        emit WorkerVacated(houseId, workerId);
+    }
+
+    /* ------------------------ Views ------------------------ */
+
+    function getOccupants(uint256 houseId) external view returns (uint256[] memory) {
+        return _occupants[houseId];
+    }
+
+    function housedAt(uint256 workerId) external view returns (uint256) {
+        return _housedAt[workerId];
+    }
+
+    /// @notice Returns whether a house has both male and female AND baby slot is not reserved.
+    function canBreed(uint256 houseId) external view returns (bool) {
+        (bool hasM, bool hasF) = isPaired(houseId);
+        return hasM && hasF && !houses.babySlotReserved(houseId);
+    }
+
+    /// @notice Returns whether the house currently has at least one male and at least one female.
+    function isPaired(uint256 houseId) public view returns (bool hasMale, bool hasFemale) {
+        uint256[] storage arr = _occupants[houseId];
+        for (uint256 i = 0; i < arr.length; i++) {
+            uint8 g = workers.genderOf(arr[i]);
+            if (g == 1) hasMale = true;
+            if (g == 2) hasFemale = true;
+        }
+    }
+}
+
+
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import {Ownable} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/access/Ownable.sol";
+
+/**
+ * Minimal allowlist that matches WorldGameHouses721's expected IRegistry:
+ *   isAllowed(venue, integrator, requiredMask) -> bool
+ *
+ * Bit meanings used by your Houses contract:
+ *   PERM_HOME_ASSIGN      = 1 << 0  (1)
+ *   PERM_HOME_VACATE      = 1 << 1  (2)
+ *   PERM_CAPACITY_RESERVE = 1 << 3  (8)
+ * Combined mask we want to grant = 1 + 2 + 8 = 11
+ */
+contract AllowlistRegistry is Ownable {
+    // venue => integrator => grantMask (bitfield)
+    mapping(address => mapping(address => uint256)) public grants;
+
+    constructor(address initialOwner) Ownable(initialOwner) {}
+
+    // Owner sets/updates permissions
+    function setAllowed(address venue, address integrator, uint256 mask) external onlyOwner {
+        grants[venue][integrator] = mask;
+    }
+
+    // Interface expected by Houses.setRegistry()
+    function isAllowed(address venue, address integrator, uint256 requiredMask) external view returns (bool) {
+        return (grants[venue][integrator] & requiredMask) == requiredMask;
+    }
+}
+
+
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+// OpenZeppelin v5.0.2 pinned imports (works in Remix)
+import {ERC721}    from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC721/ERC721.sol";
+import {ERC2981}   from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/common/ERC2981.sol";
+import {Ownable}   from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/access/Ownable.sol";
+import {AccessControl} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/access/AccessControl.sol";
+import {IERC20}    from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC20/utils/SafeERC20.sol";
+
+/**
+ * @title WorldGameWorkers721Roles
+ * @notice Workers ERC721 with:
+ *  - Public mint via USDC (default 5 USDC; owner-updateable).
+ *  - Random gender (1=Male, 2=Female) set at mint & immutable.
+ *  - Base64 avatar setter (owner/approved) with size + cooldown limits.
+ *  - ERC2981 royalties (default 1%; owner-updateable).
+ *  - AccessControl MINTER_ROLE so ReproductionManager can mint babies.
+ */
+contract WorldGameWorkers721Roles is ERC721, ERC2981, Ownable, AccessControl {
+    using SafeERC20 for IERC20;
+
+    // ---- Roles ----
+    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE"); // for babies & any admin-approved minting
+
+    // ---- Currencies / sinks ----
+    IERC20  public usdc;                 // USDC (6 decimals)
+    address public treasury;             // receives USDC mints
+
+    // ---- Config ----
+    uint256 public mintPriceUSDC = 5_000_000; // 5 USDC default
+    uint256 public nextId = 1;
+
+    // Avatar controls
+    uint256 public avatarMaxBytes = 8192;        // ~8 KB
+    uint256 public avatarCooldownSec = 24 hours; // 24h between updates
+
+    // Royalties
+    uint96  public defaultRoyaltyBps; // e.g. 100 = 1%
+
+    // ---- Token data ----
+    // 1 = Male, 2 = Female (immutable once set)
+    mapping(uint256 => uint8)   public genderOf;
+    mapping(uint256 => string)  public avatarB64Of;
+    mapping(uint256 => uint256) public lastAvatarUpdate;
+
+    // ---- Events ----
+    event TreasuryUpdated(address indexed previous, address indexed current);
+    event USDCUpdated(address indexed previous, address indexed current);
+    event MintPriceUpdated(uint256 previous, uint256 current);
+    event AvatarConfigUpdated(uint256 maxBytes, uint256 cooldownSec);
+    event WorkerMinted(address indexed to, uint256 indexed tokenId, uint8 gender, bool isBaby);
+    event AvatarUpdated(uint256 indexed tokenId);
+
+    constructor(
+        address initialOwner,
+        address usdcToken,
+        address treasuryAddr,
+        uint96 royaltyBps // e.g. 100 = 1%
+    ) ERC721("WorldGameWorkers", "WGW") Ownable(initialOwner) {
+        require(usdcToken != address(0) && treasuryAddr != address(0), "zero addr");
+
+        usdc = IERC20(usdcToken);
+        treasury = treasuryAddr;
+
+        // AccessControl admin
+        _grantRole(DEFAULT_ADMIN_ROLE, initialOwner);
+
+        // Set default royalties to treasury
+        defaultRoyaltyBps = royaltyBps;
+        if (royaltyBps > 0) {
+            _setDefaultRoyalty(treasuryAddr, royaltyBps);
+        }
+    }
+
+    // ---------------- Admin ----------------
+    function setTreasury(address newTreasury) external onlyOwner {
+        require(newTreasury != address(0), "zero addr");
+        address prev = treasury;
+        treasury = newTreasury;
+        // keep royalties in sync with treasury if using default royalty
+        if (defaultRoyaltyBps > 0) {
+            _setDefaultRoyalty(newTreasury, defaultRoyaltyBps);
+        }
+        emit TreasuryUpdated(prev, newTreasury);
+    }
+
+    function setUSDC(address newUSDC) external onlyOwner {
+        require(newUSDC != address(0), "zero addr");
+        address prev = address(usdc);
+        usdc = IERC20(newUSDC);
+        emit USDCUpdated(prev, newUSDC);
+    }
+
+    function setMintPriceUSDC(uint256 newPrice) external onlyOwner {
+        uint256 prev = mintPriceUSDC;
+        mintPriceUSDC = newPrice;
+        emit MintPriceUpdated(prev, newPrice);
+    }
+
+    function setAvatarConfig(uint256 maxBytes, uint256 cooldownSec) external onlyOwner {
+        avatarMaxBytes = maxBytes;
+        avatarCooldownSec = cooldownSec;
+        emit AvatarConfigUpdated(maxBytes, cooldownSec);
+    }
+
+    function setDefaultRoyalty(address receiver, uint96 feeNumerator) external onlyOwner {
+        defaultRoyaltyBps = feeNumerator;
+        if (feeNumerator == 0) {
+            _deleteDefaultRoyalty();
+        } else {
+            _setDefaultRoyalty(receiver, feeNumerator);
+        }
+    }
+
+    // ---------------- Public mint (paid) ----------------
+    function mint() external returns (uint256 tokenId) {
+        uint256 price = mintPriceUSDC;
+        if (price > 0) {
+            usdc.safeTransferFrom(msg.sender, treasury, price);
+        }
+        tokenId = _mintCore(msg.sender, /*isBaby=*/false);
+    }
+
+    // ---------------- Baby mint (no fee) ----------------
+    /// @notice Called by ReproductionManager (or other authorized systems).
+    function mintBaby(address to) external onlyRole(MINTER_ROLE) returns (uint256 tokenId) {
+        tokenId = _mintCore(to, /*isBaby=*/true);
+    }
+
+    // ---------------- Avatar ----------------
+    function setAvatarB64(uint256 tokenId, string calldata avatarB64) external {
+        address ownerOfToken = _ownerOf(tokenId);
+        require(ownerOfToken != address(0), "no token");
+        require(msg.sender == ownerOfToken || isApprovedForAll(ownerOfToken, msg.sender) || getApproved(tokenId) == msg.sender, "not approved");
+
+        // size & cooldown
+        require(bytes(avatarB64).length <= avatarMaxBytes, "avatar too big");
+        uint256 last = lastAvatarUpdate[tokenId];
+        require(block.timestamp >= last + avatarCooldownSec, "avatar cooldown");
+
+        avatarB64Of[tokenId] = avatarB64;
+        lastAvatarUpdate[tokenId] = block.timestamp;
+        emit AvatarUpdated(tokenId);
+    }
+
+    // ---------------- Internal core mint ----------------
+    function _mintCore(address to, bool isBaby) internal returns (uint256 tokenId) {
+        tokenId = nextId++;
+        _safeMint(to, tokenId);
+
+        // Random gender: 1 or 2
+        uint256 r = uint256(keccak256(abi.encodePacked(blockhash(block.number - 1), to, tokenId, block.timestamp)));
+        genderOf[tokenId] = uint8((r % 2) + 1);
+
+        emit WorkerMinted(to, tokenId, genderOf[tokenId], isBaby);
+    }
+
+    // ---------------- Overrides ----------------
+    function supportsInterface(bytes4 interfaceId)
+        public
+        view
+        override(ERC721, ERC2981, AccessControl)
+        returns (bool)
+    {
+        return super.supportsInterface(interfaceId);
+    }
+}
+
+
+WorldGameTreasury			0xa0800B0334Df55807a5cAcC4bfF58Db6c0023e3c
+	initialTreasury			0xcE1ebF2773775407fA1f1AB7aC3c66CC89a06634
+	initialOwner			0xcE1ebF2773775407fA1f1AB7aC3c66CC89a06634
+
+WorldGameUsd				0xe6612a74d62247F4bCCEC0899E601974a89264cE
+	initialOwner			0xcE1ebF2773775407fA1f1AB7aC3c66CC89a06634
+
+WorldGameFood				0x1cc86818855511B0FA2804fb7278b630396dD7aD
+	initialOwner			0xcE1ebF2773775407fA1f1AB7aC3c66CC89a06634
+
+WorldGameItems1155			0xb25efa88b5F78Fa2fc4fd8F871026bbB90e6cF7B
+	initialOwner			0xcE1ebF2773775407fA1f1AB7aC3c66CC89a06634
+	initialUrl			Base64 - found online
+
+EducationRegistry			0xa82a28A5f938747D7cD28D7a13849B75C8dCF1ed
+	initialOwner			0xcE1ebF2773775407fA1f1AB7aC3c66CC89a06634
+
+WorkRegistry				0x3727d1A8C9B44D23800Cd4b72f455FEbF3974283
+	initialOwner			0xcE1ebF2773775407fA1f1AB7aC3c66CC89a06634
+
+HousingRegistry				0x61Eee3E6a9bEB1076f920eA280D6140ff756B095
+	initialOwner			0xcE1ebF2773775407fA1f1AB7aC3c66CC89a06634
+
+LandRegistry				0x56498cD0b8b7c1bC6f8f3D2A243c6Cb5e6227d31
+	initialOwner			0xcE1ebF2773775407fA1f1AB7aC3c66CC89a06634
+
+LandManager				0xE0637FAf18696B84Ca4d402D458eFb2E096dF730
+	initialOwner			0xcE1ebF2773775407fA1f1AB7aC3c66CC89a06634
+	usdcToken			0xaf88d065e77c8cC2239327C5EDb3A432268e5831
+	treasuryAddr			0xcE1ebF2773775407fA1f1AB7aC3c66CC89a06634
+	initailPlots			100 (plots til huse/skoler/fabrikker/etc)
+
+WorldGameWorkers721v2			0xD16081351b8b377B108DAcE803E4497FeA300C4F
+	initialOwner			0xcE1ebF2773775407fA1f1AB7aC3c66CC89a06634
+	usdc				0xaf88d065e77c8cC2239327C5EDb3A432268e5831
+	treasuryAddr			0xcE1ebF2773775407fA1f1AB7aC3c66CC89a06634
+	royaltyBps			100 (1%)
+
+OLD!!!!!!!!!!!WorldGameWorkers721			0xf4b0Ca776Aa2Da6b0B47B6E5915C73F7f586F4ff
+	initialOwner			0xcE1ebF2773775407fA1f1AB7aC3c66CC89a06634
+	usdcToken			0xaf88d065e77c8cC2239327C5EDb3A432268e5831
+	treasuryAddr			0xcE1ebF2773775407fA1f1AB7aC3c66CC89a06634
+	royaltyBps			100 (1%)
+
+WorldGameHouses721			0xB7D91F558aDA2f3734Fb44808E7F91f5d2b8edEc
+	initialOwner			0xcE1ebF2773775407fA1f1AB7aC3c66CC89a06634
+	usdcToken			0xaf88d065e77c8cC2239327C5EDb3A432268e5831
+	wguToken			0xe6612a74d62247F4bCCEC0899E601974a89264cE
+	treasuryAddr			0xcE1ebF2773775407fA1f1AB7aC3c66CC89a06634
+
+ReproductionManager			0x7b5ed70242c459001e3B92ABE2483847e2eec51B
+	initialOwner			0xcE1ebF2773775407fA1f1AB7aC3c66CC89a06634
+
+		Worker setup		0xf4b0Ca776Aa2Da6b0B47B6E5915C73F7f586F4ff
+
+FoodShop				0xf7F0f781B0A48fc7d1A2573c069b567729708AB5
+	initialOwner			0xcE1ebF2773775407fA1f1AB7aC3c66CC89a06634
+	wguToken			0xe6612a74d62247F4bCCEC0899E601974a89264cE
+	wgfToken			0x1cc86818855511B0FA2804fb7278b630396dD7aD
+	treasuryAddr			0xcE1ebF2773775407fA1f1AB7aC3c66CC89a06634
+
+WorkVenue_fixed				0x7989262A3De86F576422D8Fad9dEf0e1820e7659
+	initialOwner			0xcE1ebF2773775407fA1f1AB7aC3c66CC89a06634
+	workers721			0xD16081351b8b377B108DAcE803E4497FeA300C4F
+	wguToken			0xe6612a74d62247F4bCCEC0899E601974a89264cE
+
+EducationVenue				0x751eeCDb9072f88C684d3B393116AFeA9Bc72877
+	initialOwner			0xcE1ebF2773775407fA1f1AB7aC3c66CC89a06634
+	workers721			0xD16081351b8b377B108DAcE803E4497FeA300C4F
+	usdcToken			0xaf88d065e77c8cC2239327C5EDb3A432268e5831
+	wguToken			0xe6612a74d62247F4bCCEC0899E601974a89264cE
+	treasuryAddr			0xcE1ebF2773775407fA1f1AB7aC3c66CC89a06634
+
+MealManager				0x78ad0603fA1F74c49AD4154Dc4C8f5045BEAdb10
+	initialOwner			0xcE1ebF2773775407fA1f1AB7aC3c66CC89a06634
+	workers721			0xD16081351b8b377B108DAcE803E4497FeA300C4F
+	houses721			0xB7D91F558aDA2f3734Fb44808E7F91f5d2b8edEc
+	wgfToken			0x1cc86818855511B0FA2804fb7278b630396dD7aD
+
+XpTracker				0xa56d24954a2b93d8E9689b8E5a5e68F9b58FDb5A
+	initialOwner			0xcE1ebF2773775407fA1f1AB7aC3c66CC89a06634
+
+OccupancyRegistry			0x707d889Feee1A106fE95b6957f882293684fD1D3
+	initialOwner			0xcE1ebF2773775407fA1f1AB7aC3c66CC89a06634
+	housesAddr			0xB7D91F558aDA2f3734Fb44808E7F91f5d2b8edEc
+	workersAddr			0xD16081351b8b377B108DAcE803E4497FeA300C4F
+
+AllowListRegistry			0x92fbE9c6329240C3ed2b1fe3212873f2047F4C60
+	initialOwner			0xcE1ebF2773775407fA1f1AB7aC3c66CC89a06634
+	
+
+
+
+
+MintWorker.html file:
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>WorldGameWorkers — Approve & Mint</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      --bg: #0e1117;
+      --panel: #1b1f29;
+      --text: #e8eaf2;
+      --muted: #a7b0c0;
+      --primary: #6ee7b7;
+      --primary-2: #34d399;
+      --danger: #f87171;
+      --warn: #fbbf24;
+    }
+    * { box-sizing: border-box }
+    body {
+      margin: 0; padding: 32px;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial;
+      color: var(--text); background: radial-gradient(1000px 600px at 15% -10%, #1a2030 0%, var(--bg) 60%);
+    }
+    h1 { margin: 4px 0 8px; font-size: 28px }
+    .sub { color: var(--muted); margin-bottom: 20px }
+    .card {
+      background: linear-gradient(180deg, #1c2231 0%, #171b25 100%);
+      border: 1px solid #2b3242; border-radius: 14px;
+      max-width: 980px; margin: 0 auto; padding: 20px;
+      box-shadow: 0 10px 30px rgba(0,0,0,.35);
+    }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px }
+    .row + .row { margin-top: 12px }
+    .field { background: var(--panel); border: 1px solid #2b3242; padding: 12px; border-radius: 10px }
+    .label { font-size: 12px; color: var(--muted); margin-bottom: 6px }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace }
+    .addr { overflow-wrap: anywhere }
+    .btns { display:flex; flex-wrap: wrap; gap: 10px; margin-top: 16px }
+    button {
+      border: 0; border-radius: 10px; padding: 12px 16px; font-weight: 600; cursor: pointer;
+      background: #2a3346; color: var(--text); transition: transform .05s ease, background .2s ease, opacity .2s ease;
+    }
+    button.primary { background: linear-gradient(180deg, var(--primary) 0%, var(--primary-2) 100%); color: #0b1220 }
+    button:hover { transform: translateY(-1px) }
+    button:disabled { opacity: .5; cursor: not-allowed; transform: none }
+    .status { margin-top: 16px; color: var(--muted); font-size: 14px; white-space: pre-wrap; word-break: break-word }
+    .pill { display:inline-block; padding:4px 8px; border-radius: 999px; font-size: 12px; background:#233048; color:#b8c1d4; border:1px solid #314160 }
+    .ok { color:#10b981 } .bad { color: var(--danger) } .warn { color: var(--warn) }
+    .grid2 { display:grid; grid-template-columns: 1fr 1fr; gap: 10px }
+
+    /* Workers list */
+    .workers-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; margin-top: 12px }
+    .worker { background: var(--panel); border: 1px solid #2b3242; border-radius: 10px; padding: 12px }
+    .kv { display:flex; justify-content: space-between; gap: 10px; font-size: 14px; margin: 6px 0 }
+    .kv span:first-child { color: var(--muted) }
+    .smallbtn { font-size: 12px; padding: 6px 10px; border-radius: 8px; }
+    .textarea { width: 100%; height: 100px; background:#0e1320; color:#cfe3ff; border:1px solid #2b3242; border-radius:8px; padding:8px; font-family: ui-monospace, monospace; }
+    @media (max-width: 700px) { .row, .grid2 { grid-template-columns: 1fr } }
+  </style>
+  <!-- Ethers v6 UMD -->
+  <script src="https://cdn.jsdelivr.net/npm/ethers@6.13.2/dist/ethers.umd.min.js"></script>
+</head>
+<body>
+  <h1>WorldGameWorkers — Mint</h1>
+  <div class="sub">Approve exactly the USDC mint price, then mint your worker NFT.</div>
+
+  <!-- Main controls -->
+  <div class="card">
+    <div class="row">
+      <div class="field">
+        <div class="label">NFT Contract</div>
+        <div class="mono addr" id="nftAddr">0xD16081351b8b377B108DAcE803E4497FeA300C4F</div>
+      </div>
+      <div class="field">
+        <div class="label">USDC Token</div>
+        <div class="mono addr" id="usdcAddr">0xaf88d065e77c8cC2239327C5EDb3A432268e5831</div>
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:12px">
+      <div class="field">
+        <div class="label">Wallet</div>
+        <div class="grid2">
+          <div class="mono addr" id="acct">Not connected</div>
+          <div class="pill mono" id="chain">Chain: —</div>
+        </div>
+      </div>
+      <div class="field">
+        <div class="label">Mint Price (reads from contract)</div>
+        <div class="grid2">
+          <div class="mono" id="priceHuman">—</div>
+          <div class="mono" id="allowance">Allowance: —</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="btns">
+      <button id="connect" class="primary">Connect Wallet</button>
+      <button id="refresh">Refresh Price</button>
+      <button id="approve">Approve Exact USDC</button>
+      <button id="mint">Mint</button>
+      <button id="approveMint" class="primary">Approve + Mint</button>
+    </div>
+
+    <div class="status mono" id="status">Ready.</div>
+  </div>
+
+  <!-- My Workers -->
+  <div class="card" style="margin-top:16px">
+    <div class="row">
+      <div class="field">
+        <div class="label">My Workers</div>
+        <div class="mono">Lists tokens owned by your wallet with on-chain details (gender, XP, level, avatar).</div>
+      </div>
+      <div class="field">
+        <div class="label">Actions</div>
+        <div class="btns">
+          <button id="loadWorkers">Load My Workers</button>
+          <button id="refreshWorkers" class="smallbtn">Refresh</button>
+        </div>
+      </div>
+    </div>
+    <div id="workersStatus" class="status mono" style="margin-top:8px">—</div>
+    <div id="workersList" class="workers-grid"></div>
+  </div>
+
+  <script>
+    const REQUIRED = {
+      CHAIN_ID_DEC: 42161,
+      CHAIN_ID_HEX: "0xa4b1",
+      NAME: "Arbitrum One",
+      RPC: "https://arb1.arbitrum.io/rpc",
+      EXPLORER: "https://arbiscan.io"
+    };
+
+    const ADDR = {
+      NFT:  "0xD16081351b8b377B108DAcE803E4497FeA300C4F",
+      USDC: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+      XP:   "0xa56d24954a2b93d8E9689b8E5a5e68F9b58FDb5A"
+    };
+
+    const USDC_DECIMALS = 6;
+
+    // ABIs
+    const NFT_ABI = [
+      {"inputs":[],"name":"mint","outputs":[{"internalType":"uint256","name":"tokenId","type":"uint256"}],"stateMutability":"nonpayable","type":"function"},
+      {"inputs":[],"name":"mintPriceUSDC","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+      {"inputs":[],"name":"nextId","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+      {"inputs":[{"internalType":"uint256","name":"tokenId","type":"uint256"}],"name":"ownerOf","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},
+      {"inputs":[{"internalType":"uint256","name":"","type":"uint256"}],"name":"genderOf","outputs":[{"internalType":"uint8","name":"","type":"uint8"}],"stateMutability":"view","type":"function"},
+      {"inputs":[{"internalType":"uint256","name":"tokenId","type":"uint256"}],"name":"getAvatar","outputs":[{"internalType":"string","name":"","type":"string"}],"stateMutability":"view","type":"function"},
+      {"inputs":[{"internalType":"uint256","name":"","type":"uint256"}],"name":"lastAvatarUpdateAt","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"}
+    ];
+    const ERC20_ABI = [
+      {"inputs":[{"internalType":"address","name":"spender","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"approve","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"},
+      {"inputs":[{"internalType":"address","name":"owner","type":"address"},{"internalType":"address","name":"spender","type":"address"}],"name":"allowance","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"}
+    ];
+    const XP_ABI = [
+      {"inputs":[{"internalType":"uint256","name":"workerId","type":"uint256"}],"name":"xpOf","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+      {"inputs":[{"internalType":"uint256","name":"workerId","type":"uint256"}],"name":"levelOf","outputs":[{"internalType":"uint8","name":"","type":"uint8"}],"stateMutability":"view","type":"function"}
+    ];
+
+    const $ = (id) => document.getElementById(id);
+    const setStatus = (msg) => $("status").textContent = msg;
+    const setWorkersStatus = (msg) => $("workersStatus").textContent = msg;
+
+    let provider, signer, acct, nft, usdc, xp;
+
+    function fmtUnits(bn, decimals) { return ethers.formatUnits(bn, decimals); }
+    function toDate(ts) {
+      const n = Number(ts);
+      if (!n) return "—";
+      const d = new Date(n * 1000);
+      return d.toLocaleString();
+    }
+    const genderLabel = (g) => (g === 1 ? "Male" : g === 2 ? "Female" : "Unknown");
+
+    async function ensureEthers() {
+      if (!(window.ethers && window.ethers.BrowserProvider)) {
+        throw new Error("Ethers library didn’t load. Check your network / adblock.");
+      }
+    }
+
+    async function connect() {
+      await ensureEthers();
+      if (!window.ethereum) throw new Error("Wallet not found. Install MetaMask.");
+      provider = new ethers.BrowserProvider(window.ethereum, "any");
+
+      // 1) request accounts
+      const accounts = await provider.send("eth_requestAccounts", []);
+      acct = accounts?.[0];
+      if (!acct) throw new Error("No account returned.");
+      $("acct").textContent = acct;
+
+      // 2) ensure Arbitrum
+      const chainIdHex = await provider.send("eth_chainId", []);
+      if (parseInt(chainIdHex, 16) !== REQUIRED.CHAIN_ID_DEC) {
+        try {
+          await provider.send("wallet_switchEthereumChain", [{ chainId: REQUIRED.CHAIN_ID_HEX }]);
+        } catch (e) {
+          if (e && e.code === 4902) {
+            await provider.send("wallet_addEthereumChain", [{
+              chainId: REQUIRED.CHAIN_ID_HEX,
+              chainName: REQUIRED.NAME,
+              nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+              rpcUrls: [REQUIRED.RPC],
+              blockExplorerUrls: [REQUIRED.EXPLORER]
+            }]);
+          } else {
+            throw e;
+          }
+        }
+      }
+
+      // 3) rebuild provider after switch
+      provider = new ethers.BrowserProvider(window.ethereum);
+      signer = await provider.getSigner();
+      const net = await provider.getNetwork();
+      $("chain").textContent = `Chain: ${REQUIRED.NAME} (${Number(net.chainId)})`;
+
+      nft  = new ethers.Contract(ADDR.NFT,  NFT_ABI, signer);
+      usdc = new ethers.Contract(ADDR.USDC, ERC20_ABI, signer);
+      xp   = new ethers.Contract(ADDR.XP,   XP_ABI,   provider); // read-only
+
+      await refresh();
+      setStatus("Wallet connected ✅");
+    }
+
+    async function refresh() {
+      try {
+        if (!provider) {
+          if (!window.ethereum) throw new Error("Wallet not detected.");
+          provider = new ethers.BrowserProvider(window.ethereum);
+        }
+        const net = await provider.getNetwork();
+        $("chain").textContent = `Chain: ${Number(net.chainId)}`;
+
+        const price = await new ethers.Contract(ADDR.NFT, NFT_ABI, provider).mintPriceUSDC();
+        $("priceHuman").textContent = `${fmtUnits(price, USDC_DECIMALS)} USDC`;
+
+        if (acct) {
+          const allowance = await new ethers.Contract(ADDR.USDC, ERC20_ABI, provider).allowance(acct, ADDR.NFT);
+          $("allowance").textContent = `Allowance: ${fmtUnits(allowance, USDC_DECIMALS)} USDC`;
+        } else {
+          $("allowance").textContent = "Allowance: —";
+        }
+        setStatus("Price refreshed ✅");
+      } catch (e) {
+        setStatus(`Read error: ${e?.reason || e?.data?.message || e?.message || e}`);
+      }
+    }
+
+    async function approveExact() {
+      try {
+        if (!signer) await connect();
+        const price = await nft.mintPriceUSDC();
+        if (price === 0n) { setStatus("Mint price is 0 — no approval needed."); return; }
+
+        const current = await usdc.allowance(acct, ADDR.NFT);
+        if (current >= price) { setStatus(`Already approved ≥ price (${fmtUnits(current, USDC_DECIMALS)} USDC).`); return; }
+
+        setStatus(`Approving ${fmtUnits(price, USDC_DECIMALS)} USDC…`);
+        const tx = await usdc.approve(ADDR.NFT, price);
+        $("approve").disabled = true; $("approveMint").disabled = true;
+        const rec = await tx.wait();
+        $("approve").disabled = false; $("approveMint").disabled = false;
+        if (rec.status !== 1) throw new Error("Approval failed");
+        setStatus(`Approval confirmed ✅  Tx: ${tx.hash}`);
+        await refresh();
+      } catch (e) {
+        setStatus(`Approve error: ${e?.reason || e?.data?.message || e?.message || e}`);
+      }
+    }
+
+    async function mintNFT() {
+      try {
+        if (!signer) await connect();
+        const price = await nft.mintPriceUSDC();
+        const allowance = await usdc.allowance(acct, ADDR.NFT);
+        if (price > allowance) {
+          setStatus(`Insufficient allowance. Approve ${fmtUnits(price, USDC_DECIMALS)} USDC first.`);
+          return;
+        }
+        setStatus("Minting…");
+        const tx = await nft.mint();
+        $("mint").disabled = true; $("approveMint").disabled = true;
+        const rec = await tx.wait();
+        $("mint").disabled = false; $("approveMint").disabled = false;
+        if (rec.status !== 1) throw new Error("Mint failed");
+        setStatus(`Minted ✅\nTx: ${tx.hash}`);
+      } catch (e) {
+        setStatus(`Mint error: ${e?.reason || e?.data?.message || e?.message || e}`);
+      }
+    }
+
+    async function approveThenMint() {
+      const before = $("status").textContent || "";
+      await approveExact();
+      const after = $("status").textContent || "";
+      if (/error/i.test(after) && !/confirmed/i.test(after)) return;
+      await mintNFT();
+    }
+
+    // ---------- Workers listing ----------
+    async function getOwnedTokenIdsViaLogs(address) {
+      const topicTransfer = ethers.id("Transfer(address,address,uint256)");
+      const acctTopic = ethers.zeroPadValue(ethers.getAddress(address), 32);
+      const latest = await provider.getBlockNumber();
+      const inLogs = await provider.getLogs({
+        address: ADDR.NFT, fromBlock: 0, toBlock: latest, topics: [topicTransfer, null, acctTopic]
+      });
+      const outLogs = await provider.getLogs({
+        address: ADDR.NFT, fromBlock: 0, toBlock: latest, topics: [topicTransfer, acctTopic, null]
+      });
+
+      const delta = new Map(); // tokenId -> +1/-1
+      for (const l of inLogs) {
+        const id = BigInt(l.topics[3]);
+        delta.set(id, (delta.get(id) || 0) + 1);
+      }
+      for (const l of outLogs) {
+        const id = BigInt(l.topics[3]);
+        delta.set(id, (delta.get(id) || 0) - 1);
+      }
+      const ids = [];
+      for (const [id, d] of delta.entries()) if (d > 0) ids.push(id);
+      ids.sort((a,b)=> (a<b?-1:1));
+      return ids;
+    }
+
+    async function getOwnedTokenIdsFallback(address) {
+      const read = new ethers.Contract(ADDR.NFT, NFT_ABI, provider);
+      const next = await read.nextId(); // next to be minted
+      const maxId = Number(next) - 1;
+      const ids = [];
+      const LIMIT = 5000;
+      const upper = Math.min(maxId, LIMIT);
+      for (let i=1; i<=upper; i++) {
+        try {
+          const o = await read.ownerOf(i);
+          if (ethers.getAddress(o) === ethers.getAddress(address)) ids.push(BigInt(i));
+        } catch {}
+      }
+      return ids;
+    }
+
+    async function loadMyWorkers() {
+      try {
+        if (!signer) await connect();
+        setWorkersStatus("Loading your workers…");
+        $("loadWorkers").disabled = true;
+        $("refreshWorkers").disabled = true;
+
+        let tokenIds = [];
+        try {
+          tokenIds = await getOwnedTokenIdsViaLogs(acct);
+        } catch (e) {
+          tokenIds = await getOwnedTokenIdsFallback(acct);
+        }
+
+        if (!tokenIds.length) {
+          setWorkersStatus("No workers found for this wallet.");
+          $("workersList").innerHTML = "";
+          $("loadWorkers").disabled = false;
+          $("refreshWorkers").disabled = false;
+          return;
+        }
+
+        const read = new ethers.Contract(ADDR.NFT, NFT_ABI, provider);
+        const xpC  = new ethers.Contract(ADDR.XP,  XP_ABI,  provider);
+
+        const workers = [];
+        for (const id of tokenIds) {
+          let gender=0, avatar="", last=0n, xpVal=0n, level=0;
+          try { gender = Number(await read.genderOf(id)); } catch {}
+          try { avatar = await read.getAvatar(id); } catch {}
+          try { last = await read.lastAvatarUpdateAt(id); } catch {}
+          try { xpVal = await xpC.xpOf(id); } catch {}
+          try { level = await xpC.levelOf(id); } catch {}
+          workers.push({ id: id.toString(), gender, avatar, last: last.toString(), xp: xpVal.toString(), level });
+        }
+
+        const list = $("workersList");
+        list.innerHTML = workers.map(w => {
+          const hasAvatar = (w.avatar && w.avatar.length > 0);
+          return `
+            <div class="worker">
+              <div class="kv"><span>Token ID</span><strong>#${w.id}</strong></div>
+              <div class="kv"><span>Gender</span><span>${genderLabel(w.gender)} (${w.gender})</span></div>
+              <div class="kv"><span>XP</span><span>${w.xp} (Level ${w.level})</span></div>
+              <div class="kv"><span>Avatar</span><span>${hasAvatar ? "Set" : "—"}</span></div>
+              <div class="kv"><span>Last Avatar Update</span><span>${toDate(w.last)}</span></div>
+              ${hasAvatar ? `
+                <details style="margin-top:8px">
+                  <summary class="mono">Show avatar Base64</summary>
+                  <textarea class="textarea" readonly>${w.avatar}</textarea>
+                </details>` : ``}
+            </div>
+          `;
+        }).join("");
+        setWorkersStatus(`Loaded ${workers.length} worker(s).`);
+      } catch (e) {
+        setWorkersStatus(`Load error: ${e?.reason || e?.data?.message || e?.message || e}`);
+      } finally {
+        $("loadWorkers").disabled = false;
+        $("refreshWorkers").disabled = false;
+      }
+    }
+
+    // UI wiring
+    window.addEventListener("DOMContentLoaded", async () => {
+      $("nftAddr").textContent = ADDR.NFT;
+      $("usdcAddr").textContent = ADDR.USDC;
+
+      $("connect").addEventListener("click", connect);
+      $("refresh").addEventListener("click", refresh);
+      $("approve").addEventListener("click", approveExact);
+      $("mint").addEventListener("click", mintNFT);
+      $("approveMint").addEventListener("click", approveThenMint);
+
+      $("loadWorkers").addEventListener("click", loadMyWorkers);
+      $("refreshWorkers").addEventListener("click", loadMyWorkers);
+
+      if (window.ethereum) {
+        try {
+          const p = new ethers.BrowserProvider(window.ethereum);
+          const accounts = await p.send("eth_accounts", []);
+          if (accounts && accounts[0]) {
+            acct = accounts[0];
+            $("acct").textContent = acct;
+          }
+        } catch {}
+        window.ethereum.on?.("accountsChanged", async (accs) => {
+          acct = (accs && accs[0]) ? accs[0] : null;
+          $("acct").textContent = acct || "Not connected";
+          $("workersList").innerHTML = "";
+          $("workersStatus").textContent = "—";
+          if (acct) await refresh();
+        });
+        window.ethereum.on?.("chainChanged", () => location.reload());
+      } else {
+        setStatus("Wallet not detected. Please install MetaMask.");
+      }
+    });
+  </script>
+</body>
+</html>
+
+
+
+MintHouses.html:
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>WorldGame – Lands • Houses • Workers • Breeding • Balances</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Ethers v6 UMD -->
+<script src="https://cdn.jsdelivr.net/npm/ethers@6.13.2/dist/ethers.umd.min.js"></script>
+<style>
+:root{--bg:#0e1116;--panel:#1b222c;--text:#e8eef8;--muted:#a9b2c2;--ok:#22c55e;--warn:#f59e0b;--bad:#ef4444;--primary:#3b82f6}
+*{box-sizing:border-box}
+body{margin:0;background:linear-gradient(180deg,#0e1116,#202832);color:var(--text);font-family:ui-sans-serif,system-ui,Segoe UI,Roboto}
+header{padding:16px 20px;text-align:center;background:#141a22;border-bottom:1px solid #2a3440;font-weight:600}
+#controls{display:flex;flex-wrap:wrap;gap:10px;justify-content:center;padding:12px}
+button,select,input[type="radio"]+label{background:#2c3748;color:#fff;border:1px solid #4e5a6a;border-radius:8px;padding:10px 12px;cursor:pointer}
+button:hover{background:#3c4b61}button:disabled{opacity:.55;cursor:not-allowed}
+select{padding:10px 8px}
+.btn-primary{background:#3b82f6;border-color:#3b82f6}
+.btn-green{background:#22c55e;border-color:#22c55e}
+#priceRow{display:flex;gap:10px;flex-wrap:wrap;justify-content:center;font-size:.95rem;color:var(--muted)}
+.pill{background:#223048;border:1px solid #2f405e;border-radius:999px;padding:6px 10px}
+#grid{display:grid;gap:4px;margin:12px auto 8px;max-width:95vw}
+.plot{width:42px;height:42px;display:flex;align-items:center;justify-content:center;background:#15673b;border-radius:4px;font-size:20px;cursor:pointer;transition:.15s}
+.plot:hover{transform:scale(1.06)}
+.occupied{background:#9b1b1b;cursor:default}
+.owned{background:#b59b1b}
+#log{background:#11161e;border-top:1px solid #2a3440;height:190px;overflow:auto;padding:8px 12px;font-family:ui-monospace,Consolas,monospace;font-size:.85rem}
+#log p{margin:.25rem 0;white-space:pre-wrap}
+.row{display:flex;gap:8px;flex-wrap:wrap;justify-content:center}
+.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:50}
+.modal{background:#111722;border:1px solid #2a3440;border-radius:12px;max-width:980px;width:min(94vw,980px);max-height:86vh;overflow:auto;padding:14px}
+.modal h3{margin:4px 0 10px}
+.house-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px}
+.house-card{background:#1a2230;border:1px solid #2a3346;border-radius:10px;padding:10px}
+.house-card .id{font-weight:700}.house-card .mut{color:var(--muted);font-size:.9rem}
+.house-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.right{margin-left:auto}
+.input{background:#0e1320;color:#cfe3ff;border:1px solid #2a3346;border-radius:8px;padding:8px}
+.radio-wrap{display:flex;gap:8px;align-items:center}.radio-wrap input{display:none}.radio-wrap input+label{padding:8px 10px;border-radius:8px}.radio-wrap input:checked+label{outline:2px solid #3b82f6}
+.divider{height:1px;background:#293446;margin:10px 0}
+.hint{color:var(--muted);font-size:.95rem}.small{font-size:.9rem;color:var(--muted)}
+.chip{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid #33415c;margin-left:6px;font-size:.8rem}
+.male{background:#1e3a8a}.female{background:#831843}
+a{color:#93c5fd;text-decoration:underline}.dim{opacity:.6}
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+@media (max-width:800px){.two-col{grid-template-columns:1fr}}
+.balances-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px}
+.balance-card{background:#161e2a;border:1px solid #2a3346;border-radius:10px;padding:10px}
+.balance-card h4{margin:0 0 6px}
+.warnbox{background:#2a1a1a;border:1px solid #6b1d1d;color:#ffd1d1;border-radius:8px;padding:8px;margin-top:6px}
+</style>
+</head>
+<body>
+<header>🏠 WorldGame — Buy Houses • Place • Assign • Refuel • Breed • Balances</header>
+
+<div id="controls">
+  <button id="connectBtn" class="btn-primary">🔌 Connect Wallet</button>
+  <button id="buyHouseBtn" class="btn-green">💰 Buy House</button>
+  <button id="myHousesBtn">🏠 My Houses</button>
+  <button id="myWorkersBtn">👷 My Workers</button>
+  <button id="balancesBtn">💼 Balances</button>
+  <select id="landSelect" title="Switch Land"></select>
+</div>
+
+<div id="priceRow">
+  <span id="usdcPrice" class="pill">House: — USDC</span>
+  <span id="wguPrice" class="pill">House: — WGU</span>
+  <span id="upgradePrice" class="pill">Upgrade/Bedroom: — WGU</span>
+</div>
+
+<div class="row hint" style="margin:4px 0 4px">🟩 Empty (click to place) • 🟨 Your house (click to manage) • 🟥 Others’ house</div>
+<div id="grid"></div>
+
+<!-- Modal: My Houses -->
+<div id="modalBg" class="modal-backdrop">
+  <div class="modal">
+    <div class="row" style="align-items:center">
+      <h3 style="margin-right:auto">🏠 My Houses</h3>
+      <button id="closeModal">✖ Close</button>
+    </div>
+    <div class="divider"></div>
+    <div class="row" style="align-items:center;gap:12px">
+      <div class="radio-wrap"><input type="radio" id="payUSDC" name="payToken" value="USDC" checked><label for="payUSDC">Pay USDC</label></div>
+      <div class="radio-wrap"><input type="radio" id="payWGU" name="payToken" value="WGU"><label for="payWGU">Pay WGU</label></div>
+      <button id="mintFromModal" class="btn-green">Mint House</button>
+    </div>
+    <div class="divider"></div>
+    <div class="hint">Select a house to upgrade or to place on a plot.</div>
+    <div id="houseList" class="house-list"></div>
+  </div>
+</div>
+
+<!-- Modal: House Manager -->
+<div id="manageBg" class="modal-backdrop">
+  <div class="modal">
+    <div class="row" style="align-items:center">
+      <h3 style="margin-right:auto">🏠 House Manager</h3>
+      <button id="closeManage">✖ Close</button>
+    </div>
+    <div class="divider"></div>
+    <div id="manageInfo" class="small">—</div>
+
+    <div class="divider"></div>
+    <div class="row"><span class="hint">Manage workers in this house:</span></div>
+
+    <div class="divider"></div>
+    <h4>👷 Your Workers</h4>
+    <div id="workersList" class="house-list"></div>
+
+    <div class="divider"></div>
+    <div class="two-col">
+      <div>
+        <h4>🍼 Breeding</h4>
+        <div class="hint">Pick a mother & father (gendered), ensure the baby slot is reserved, then attempt.</div>
+        <div class="row" style="margin-top:8px;gap:8px;align-items:center">
+          <label>Mother</label><select id="motherSel"></select>
+          <label>Father</label><select id="fatherSel"></select>
+        </div>
+        <div class="row small" id="breedInfo" style="margin-top:6px">—</div>
+        <div id="minterRoleWarn" class="warnbox" style="display:none">⚠️ ReproductionManager does not have <b>MINTER_ROLE</b> on Workers — pregnancy will revert. Grant it in Workers: <code>grantRole(MINTER_ROLE, ReproductionManager)</code>.</div>
+        <div class="row" style="margin-top:6px">
+          <button id="approvePill" class="btn-primary">Approve Pills</button>
+          <button id="tryBreed" class="btn-green" disabled>Attempt Pregnancy</button>
+        </div>
+        <div class="small" id="breedResult" style="margin-top:6px;color:#cfe3ff">—</div>
+      </div>
+      <div>
+        <h4>🍼 Baby Slot</h4>
+        <div class="hint">Baby slot must be reserved before attempting.</div>
+        <div class="row" style="margin-top:6px">
+          <button id="toggleBabySlot" class="btn-primary">Toggle Baby Slot</button>
+        </div>
+        <div class="small" id="babySlotNote" style="margin-top:6px">—</div>
+      </div>
+    </div>
+
+    <div class="divider"></div>
+    <div class="row"><div id="breedStatus" class="hint">—</div><div class="right"></div></div>
+  </div>
+</div>
+
+<!-- Modal: Workers Overview -->
+<div id="workersBg" class="modal-backdrop">
+  <div class="modal">
+    <div class="row" style="align-items:center">
+      <h3 style="margin-right:auto">👷 Workers Overview</h3>
+      <button id="closeWorkers">✖ Close</button>
+    </div>
+    <div class="divider"></div>
+    <div class="hint">Each worker shows its assigned house (if any). Click the house number to open its manager.</div>
+    <div class="divider"></div>
+    <div id="workersOverview" class="house-list"></div>
+  </div>
+</div>
+
+<!-- Modal: Balances -->
+<div id="balancesBg" class="modal-backdrop">
+  <div class="modal">
+    <div class="row" style="align-items:center">
+      <h3 style="margin-right:auto">💼 Balances</h3>
+      <button id="closeBalances">✖ Close</button>
+    </div>
+    <div class="divider"></div>
+    <div id="balancesGrid" class="balances-grid"></div>
+    <div class="divider"></div>
+    <div id="pillMeta" class="small">—</div>
+  </div>
+</div>
+
+<div id="log"><p><strong>📜 Log Console:</strong></p></div>
+
+<script>
+/* ========= CONFIG ========= */
+var CONFIG = {
+  chainIdDec: 42161,
+  chainIdHex: "0xa4b1",
+  landManager: "0xE0637FAf18696B84Ca4d402D458eFb2E096dF730",
+  houses:      "0xB7D91F558aDA2f3734Fb44808E7F91f5d2b8edEc",
+  // UPDATED Workers address with MINTER_ROLE:
+  workers:     "0xD16081351b8b377B108DAcE803E4497FeA300C4F",
+  occupancy:   "0x707d889Feee1A106fE95b6957f882293684fD1D3",
+  mealManager: "0x78ad0603fA1F74c49AD4154Dc4C8f5045BEAdb10",
+  repro:       "0x7b5ed70242c459001e3B92ABE2483847e2eec51B",
+  usdc: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+  wgu:  "0xe6612a74d62247F4bCCEC0899E601974a89264cE",
+  wgf:  "0x1cc86818855511B0FA2804fb7278b630396dD7aD",
+  pill1155: "0xb25efa88b5F78Fa2fc4fd8F871026bbB90e6cF7B",
+  pillIdFallback: 1001, /* your pill ID */
+  decimals: { USDC: 6, WGU: 2, WGF: 0 }
+};
+
+/* ========= STATE ========= */
+var provider=null, signer=null, userAddress=null;
+var landManager=null, houses=null, occupancy=null, workers=null, mealManager=null, repro=null;
+var currentLandId=1, pendingPlacePlotId=null, manageTokenId=null;
+var reproIface=null;
+
+/* ========= LOG ========= */
+function $(id){return document.getElementById(id);}
+function log(msg){var p=document.createElement("p");p.textContent=msg;var d=$("log");d.appendChild(p);d.scrollTop=d.scrollHeight;}
+
+/* ========= ABIs ========= */
+var landAbi=[
+ "function nextLandId() view returns(uint256)",
+ "function lands(uint256) view returns(bool exists, uint256 plotCount)",
+ "function placements(uint256,uint256) view returns(address owner,uint8 kind,address assetContract,uint256 assetId,uint256 placedAt)",
+ "function placementFee(uint256,uint8) view returns(uint256)",
+ "function place(uint256,uint256,uint8,address,uint256)"
+];
+var houseAbi=[
+ "function housePriceUSDC() view returns(uint256)",
+ "function housePriceWGU() view returns(uint256)",
+ "function upgradePriceWGUPerBedroom() view returns(uint256)",
+ "function mintHouse(bool payWithUSDC) returns(uint256)",
+ "function bedroomsOf(uint256) view returns(uint256)",
+ "function occupantsOf(uint256) view returns(uint256)",
+ "function babySlotReserved(uint256) view returns(bool)",
+ "function upgradeHouse(uint256,uint256)",
+ "function homeAssign(uint256)",
+ "function homeVacate(uint256)",
+ "function setBabySlotReserved(uint256,bool)"
+];
+var erc20Abi=[
+ "function allowance(address,address) view returns(uint256)",
+ "function approve(address,uint256) returns(bool)",
+ "function balanceOf(address) view returns(uint256)"
+];
+var erc1155Abi=[
+ "function isApprovedForAll(address,address) view returns(bool)",
+ "function setApprovalForAll(address,bool)",
+ "function balanceOf(address,uint256) view returns(uint256)"
+];
+var workersAbi=[
+ "function ownerOf(uint256) view returns(address)",
+ "function genderOf(uint256) view returns(uint8)",
+ "function nextId() view returns(uint256)",
+ "function mintBaby(address) returns(uint256)",
+ // MINTER_ROLE support (new):
+ "function MINTER_ROLE() view returns (bytes32)",
+ "function hasRole(bytes32,address) view returns (bool)"
+];
+var occupancyAbi=[
+ "function getOccupants(uint256) view returns(uint256[])",
+ "function assign(uint256,uint256)",
+ "function vacate(uint256)",
+ "function canBreed(uint256) view returns(bool)",
+ "function housedAt(uint256) view returns(uint256)"
+];
+var mealAbi=[
+ "function refuel(uint256,uint256)",
+ "function remainingMeal(uint256) view returns(uint256)",
+ "function mealCostWGF() view returns(uint256)"
+];
+var reproAbi=[
+ "function attempt(uint256,uint256,uint256) returns (bool,uint256)",
+ "function nextAttemptTime(uint256,uint256,uint256) view returns (uint256)",
+ "function successRateBps() view returns (uint256)",
+ "function successCooldownSec() view returns (uint256)",
+ "function failureCooldownSec() view returns (uint256)",
+ "function pillToken() view returns (address)",
+ "function pillId() view returns (uint256)",
+ "function pillPerAttempt() view returns (uint256)"
+];
+
+/* ========= HELPERS ========= */
+function fmt(a,dec){return ethers.formatUnits(a,dec||18);}
+function fmtDuration(sec){sec=Number(sec||0);if(sec<=0)return"0s";var h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60),s=Math.floor(sec%60);return h+"h "+m+"m "+s+"s";}
+function fmtDate(ts){var n=Number(ts||0);if(!n)return"—";return new Date(n*1000).toLocaleString();}
+
+/* ========= CONNECT ========= */
+async function connectWallet(){
+  try{
+    if(!(window.ethers&&ethers.BrowserProvider)){throw new Error("Ethers not loaded");}
+    if(!window.ethereum){throw new Error("MetaMask not found");}
+
+    provider=new ethers.BrowserProvider(window.ethereum,"any");
+    var accs=await provider.send("eth_requestAccounts",[]); userAddress=accs&&accs[0];
+    if(!userAddress) throw new Error("No account returned");
+
+    var chainHex=await provider.send("eth_chainId",[]);
+    if(parseInt(chainHex,16)!==CONFIG.chainIdDec){
+      try{await provider.send("wallet_switchEthereumChain",[{"chainId":CONFIG.chainIdHex}]);}
+      catch(e){
+        if(e&&e.code===4902){
+          await provider.send("wallet_addEthereumChain",[{
+            chainId:CONFIG.chainIdHex,chainName:"Arbitrum One",
+            nativeCurrency:{name:"Ether",symbol:"ETH",decimals:18},
+            rpcUrls:["https://arb1.arbitrum.io/rpc"],blockExplorerUrls:["https://arbiscan.io"]
+          }]);
+        }else{throw e;}
+      }
+    }
+
+    provider=new ethers.BrowserProvider(window.ethereum); signer=await provider.getSigner();
+    landManager=new ethers.Contract(CONFIG.landManager,landAbi,signer);
+    houses=new ethers.Contract(CONFIG.houses,houseAbi,signer);
+    occupancy=new ethers.Contract(CONFIG.occupancy,occupancyAbi,signer);
+    workers=new ethers.Contract(CONFIG.workers,workersAbi,signer);
+    mealManager=new ethers.Contract(CONFIG.mealManager,mealAbi,signer);
+    repro=new ethers.Contract(CONFIG.repro,reproAbi,signer);
+
+    // Event iface
+    reproIface=new ethers.Interface([
+      "event PregnancyAttempted(address indexed owner,uint256 indexed motherId,uint256 indexed fatherId,uint256 houseId,bool success,uint256 babyTokenId,uint256 nextEligibleAt)"
+    ]);
+
+    log("✅ Connected: "+userAddress);
+    await refreshPrices(); await populateLandSelector(); await renderLand(currentLandId);
+
+    if(window.ethereum&&window.ethereum.on){
+      window.ethereum.on("accountsChanged",function(){location.reload();});
+      window.ethereum.on("chainChanged",function(){location.reload();});
+    }
+  }catch(err){log("❌ Connect failed: "+(err&&err.message?err.message:String(err)));}
+}
+
+/* ========= PRICES ========= */
+async function refreshPrices(){
+  try{
+    var pUSDC=await houses.housePriceUSDC();
+    var pWGU=await houses.housePriceWGU();
+    var pUp=await houses.upgradePriceWGUPerBedroom();
+    $("usdcPrice").textContent="House: "+fmt(pUSDC,CONFIG.decimals.USDC)+" USDC";
+    $("wguPrice").textContent="House: "+fmt(pWGU,CONFIG.decimals.WGU)+" WGU";
+    $("upgradePrice").textContent="Upgrade/Bedroom: "+fmt(pUp,CONFIG.decimals.WGU)+" WGU";
+  }catch(e){log("⚠️ Read price error: "+e);}
+}
+
+/* ========= LANDS ========= */
+async function populateLandSelector(){
+  var nextId=await landManager.nextLandId(); var sel=$("landSelect"); sel.innerHTML="";
+  for(var i=1;i<Number(nextId);i++){var o=document.createElement("option");o.value=String(i);o.textContent="Land #"+i;sel.appendChild(o);}
+  sel.value=String(currentLandId);
+  sel.onchange=async function(){currentLandId=Number(sel.value);await renderLand(currentLandId);};
+}
+
+async function renderLand(id){
+  var grid=$("grid"); grid.innerHTML="";
+  var land=await landManager.lands(id); if(!land[0]){log("⚠️ Land "+id+" !exists");return;}
+  var plots=Number(land[1]); var cols=Math.ceil(Math.sqrt(plots)); grid.style.gridTemplateColumns="repeat("+cols+",42px)";
+
+  for(var i=1;i<=plots;i++){
+    (function(plotId){
+      var cell=document.createElement("div"); cell.className="plot";
+      landManager.placements(id,plotId).then(function(p){
+        var owner=p[0], assetId=p[3];
+        if(owner!==ethers.ZeroAddress){
+          var isMine=(userAddress && ethers.getAddress(owner)===ethers.getAddress(userAddress));
+          cell.textContent="🏠"; cell.title="Plot "+plotId+"\nOwner: "+owner+"\nToken: "+assetId;
+          if(isMine){cell.classList.add("owned"); cell.onclick=function(){openManageModal(Number(assetId));};}
+          else{cell.classList.add("occupied");}
+        }else{
+          cell.title="Plot "+plotId+"\nEmpty (click to place)";
+          cell.onclick=function(){pendingPlacePlotId=plotId; openHousesModal(true);};
+        }
+      }).catch(function(e){log("Plot read error "+plotId+": "+e);});
+      grid.appendChild(cell);
+    })(i);
+  }
+  log("🗺️ Land #"+id+" loaded with "+plots+" plots.");
+}
+
+/* ========= APPROVAL HELPERS ========= */
+async function ensureAllowance(tokenAddr,spender,needed,dec,label){
+  var erc=new ethers.Contract(tokenAddr,erc20Abi,signer);
+  var allow=await erc.allowance(userAddress,spender);
+  if(allow>=needed) return;
+  log("Approving "+fmt(needed,dec)+" "+label+" to "+spender+" …");
+  var tx=await erc.approve(spender,needed); await tx.wait(); log("✅ Approved "+label);
+}
+async function ensure1155Approval(tokenAddr,operator){
+  var t=new ethers.Contract(tokenAddr,erc1155Abi,signer);
+  var ok=await t.isApprovedForAll(userAddress,operator);
+  if(ok) return;
+  var tx=await t.setApprovalForAll(operator,true); await tx.wait(); log("✅ ERC1155 approval granted");
+}
+
+/* ========= BUY / UPGRADE / PLACE ========= */
+async function buyHouse(payToken){
+  try{
+    var payWithUSDC = (payToken==="USDC");
+    var price = payWithUSDC ? await houses.housePriceUSDC() : await houses.housePriceWGU();
+    var tokenAddr = payWithUSDC ? CONFIG.usdc : CONFIG.wgu;
+    var dec = payWithUSDC ? CONFIG.decimals.USDC : CONFIG.decimals.WGU;
+    if(price>0n){await ensureAllowance(tokenAddr,CONFIG.houses,price,dec,payToken);}
+    log("Minting house ("+payToken+")…");
+    var tx=await houses.mintHouse(payWithUSDC); await tx.wait(); log("✅ House minted");
+    await refreshPrices(); await loadMyHouses(false);
+  }catch(e){log("❌ Buy failed: "+e);}
+}
+async function upgradeHouse(tokenId,toBedrooms){
+  try{
+    var current=await houses.bedroomsOf(tokenId);
+    if(BigInt(toBedrooms)<=current){log("No increase");return;}
+    var steps=BigInt(toBedrooms)-current;
+    var pricePer=await houses.upgradePriceWGUPerBedroom();
+    var cost=steps*pricePer;
+    if(cost>0n){await ensureAllowance(CONFIG.wgu,CONFIG.houses,cost,CONFIG.decimals.WGU,"WGU");}
+    log("Upgrading #"+tokenId+" → "+toBedrooms+" bedrooms…");
+    var tx=await houses.upgradeHouse(tokenId,toBedrooms); await tx.wait(); log("✅ Upgrade done");
+    await loadMyHouses(false);
+  }catch(e){log("❌ Upgrade failed: "+e);}
+}
+async function placeHouseOnPendingPlot(tokenId){
+  if(!pendingPlacePlotId){log("Pick a green plot first");return;}
+  try{
+    var kind=1; // HOUSE
+    var fee=await landManager.placementFee(currentLandId,kind);
+    if(fee>0n){await ensureAllowance(CONFIG.usdc,CONFIG.landManager,fee,CONFIG.decimals.USDC,"USDC");}
+    log("Placing house #"+tokenId+" → Land "+currentLandId+", Plot "+pendingPlacePlotId+" …");
+    var tx=await landManager.place(currentLandId,pendingPlacePlotId,kind,CONFIG.houses,tokenId);
+    await tx.wait(); log("✅ Placement complete");
+    pendingPlacePlotId=null; closeHousesModal(); await renderLand(currentLandId);
+  }catch(e){log("❌ Placement failed: "+e);}
+}
+
+/* ========= LIST MY HOUSES ========= */
+async function getOwnedHouseIdsViaLogs(owner){
+  var topicTransfer=ethers.id("Transfer(address,address,uint256)");
+  var acctTopic=ethers.zeroPadValue(ethers.getAddress(owner),32);
+  var latest=await provider.getBlockNumber();
+  var inLogs=await provider.getLogs({address:CONFIG.houses,fromBlock:0,toBlock:latest,topics:[topicTransfer,null,acctTopic]});
+  var outLogs=await provider.getLogs({address:CONFIG.houses,fromBlock:0,toBlock:latest,topics:[topicTransfer,acctTopic,null]});
+  var delta={}; var i, id;
+  for(i=0;i<inLogs.length;i++){id=BigInt(inLogs[i].topics[3]); delta[id]=(delta[id]||0)+1;}
+  for(i=0;i<outLogs.length;i++){id=BigInt(outLogs[i].topics[3]); delta[id]=(delta[id]||0)-1;}
+  var ids=[]; for(id in delta){ if(delta[id]>0){ ids.push(BigInt(id)); } }
+  ids.sort(function(a,b){return a<b?-1:1}); return ids;
+}
+
+/* ========= HOUSES MODAL ========= */
+function openHousesModal(picking){$("modalBg").style.display="flex"; loadMyHouses(picking);}
+function closeHousesModal(){$("modalBg").style.display="none"; pendingPlacePlotId=null;}
+
+async function loadMyHouses(picking){
+  var list=$("houseList"); list.innerHTML="";
+  if(!userAddress){list.innerHTML="<div class='hint'>Connect wallet.</div>";return;}
+  var ids=await getOwnedHouseIdsViaLogs(userAddress);
+  if(!ids.length){list.innerHTML="<div class='hint'>No houses found. Use “Mint House”.</div>";return;}
+  for(var k=0;k<ids.length;k++){
+    var id=ids[k]; var beds=0n,occ=0n,res=false;
+    try{beds=await houses.bedroomsOf(id);occ=await houses.occupantsOf(id);res=await houses.babySlotReserved(id);}catch(e){}
+    var card=document.createElement("div"); card.className="house-card";
+    var pickBtn = picking ? "<button data-place='"+String(id)+"' class='btn-green'>Place on selected plot</button>" : "";
+    card.innerHTML="" +
+      "<div class='id'>House #"+String(id)+"</div>" +
+      "<div class='mut'>Bedrooms: "+String(beds)+" • Occupants: "+String(occ)+" • "+(res?"BabySlot: reserved":"BabySlot: free")+"</div>" +
+      "<div class='house-actions'>" +
+        "<input class='input' style='width:110px' type='number' min='"+(Number(beds)+1)+"' step='1' placeholder='New beds' id='nb-"+String(id)+"'>" +
+        "<button data-up='"+String(id)+"' class='btn-primary'>Upgrade</button>" +
+        pickBtn +
+      "</div>";
+    list.appendChild(card);
+  }
+  var ups=list.querySelectorAll("button[data-up]"); for(var u=0;u<ups.length;u++){
+    ups[u].onclick=function(ev){
+      var id=this.getAttribute("data-up"); var nb=$("nb-"+id); var to=parseInt(nb.value||"0",10);
+      if(!to||to<1){log("Enter valid bedrooms number");return;} upgradeHouse(Number(id),to);
+    };
+  }
+  var places=list.querySelectorAll("button[data-place]"); for(var p=0;p<places.length;p++){
+    places[p].onclick=function(){var id=this.getAttribute("data-place"); placeHouseOnPendingPlot(Number(id));};
+  }
+}
+
+/* ========= HOUSE MANAGER ========= */
+function openManageModal(tokenId){manageTokenId=tokenId;$("manageBg").style.display="flex";refreshManageModal();}
+function closeManageModal(){manageTokenId=null;$("manageBg").style.display="none";$("workersList").innerHTML="";$("manageInfo").textContent="—";$("breedStatus").textContent="—";$("breedInfo").textContent="—";$("breedResult").textContent="—";$("babySlotNote").textContent="—";$("motherSel").innerHTML="";$("fatherSel").innerHTML="";$("tryBreed").disabled=true;}
+
+async function refreshManageModal(){
+  if(!manageTokenId) return;
+  var data=await Promise.all([houses.bedroomsOf(manageTokenId),houses.occupantsOf(manageTokenId),houses.babySlotReserved(manageTokenId),occupancy.getOccupants(manageTokenId),occupancy.canBreed(manageTokenId)]);
+  var beds=data[0],occ=data[1],reserved=data[2],listIds=data[3],canBreed=data[4];
+  $("manageInfo").innerHTML="House #"+manageTokenId+" — Bedrooms: <b>"+beds+"</b> • Occupants: <b>"+occ+"</b> • BabySlot: <b>"+(reserved?"reserved":"free")+"</b>";
+  $("breedStatus").textContent=canBreed?"💚 Ready to Breed":"❌ Not ready (need male+female and free baby slot)";
+  await buildParentSelectors(listIds,reserved); await loadMyWorkersList(listIds); await refreshBreedControls();
+}
+
+async function buildParentSelectors(currentOccupants,reserved){
+  var motherSel=$("motherSel"), fatherSel=$("fatherSel"); motherSel.innerHTML=""; fatherSel.innerHTML="";
+  var nextId=0n; try{nextId=await workers.nextId();}catch(e){}
+  var maxId=Number(nextId)-1; var occSet={}; for(var i=0;i<(currentOccupants||[]).length;i++){occSet[String(currentOccupants[i])]=true;}
+  var mothers=[],fathers=[];
+  for(var t=1;t<=maxId;t++){
+    try{
+      var o=await workers.ownerOf(t); if(o.toLowerCase()!==userAddress.toLowerCase()) continue;
+      var g=Number(await workers.genderOf(t));
+      var opt=document.createElement("option"); opt.value=String(t);
+      opt.textContent="#"+t+" "+(g===1?"(♂)":"(♀)")+(occSet[String(t)]?" • in this house":"");
+      if(g===2)mothers.push(opt); else if(g===1)fathers.push(opt);
+    }catch(e){}
+  }
+  if(mothers.length===0||fathers.length===0){var warn=document.createElement("option");warn.value="";warn.textContent="No eligible workers";motherSel.appendChild(warn.cloneNode(true));fatherSel.appendChild(warn);}
+  else{for(var a=0;a<mothers.length;a++)motherSel.appendChild(mothers[a]); for(var b=0;b<fathers.length;b++)fatherSel.appendChild(fathers[b]);}
+  await refreshBreedInfo(reserved);
+}
+
+/* === NEW: Show MINTER_ROLE status in breeding panel === */
+async function checkMinterRole(){
+  try{
+    var role=await workers.MINTER_ROLE();
+    var has=await workers.hasRole(role,CONFIG.repro);
+    $("minterRoleWarn").style.display = has ? "none" : "block";
+    return has;
+  }catch(e){
+    log("⚠️ MINTER_ROLE check failed: "+e);
+    $("minterRoleWarn").style.display="block"; // conservative
+    return false;
+  }
+}
+
+async function refreshBreedInfo(reserved){
+  try{
+    var vals=await Promise.all([repro.successRateBps(),repro.successCooldownSec(),repro.failureCooldownSec(),repro.pillToken(),repro.pillId(),repro.pillPerAttempt()]);
+    var rate=vals[0],succCd=vals[1],failCd=vals[2],pillAddr=vals[3],pillId=vals[4],per=vals[5];
+    var pill=(pillAddr&&pillAddr!==ethers.ZeroAddress)?pillAddr:CONFIG.pill1155;
+    var chosenId=Number(pillId)||CONFIG.pillIdFallback;
+    var pillBal="-";
+    if(pill){var e1155=new ethers.Contract(pill,erc1155Abi,signer); pillBal=await e1155.balanceOf(userAddress,chosenId);}
+    $("breedInfo").innerHTML="Success Rate: <b>"+(Number(rate)/100)+"%</b> • Success cooldown: <b>"+fmtDuration(succCd)+"</b> • Failure: <b>"+fmtDuration(failCd)+"</b><br>Pill: needs <b>"+per+"</b> × ID <b>"+chosenId+"</b> • Your balance: <b>"+pillBal+"</b> • "+(reserved?"BabySlot reserved ✅":"BabySlot not reserved ⚠️");
+    $("babySlotNote").textContent=reserved?"Baby slot is reserved; you can attempt.":"Reserve baby slot first.";
+    await checkMinterRole();
+  }catch(e){$("breedInfo").textContent="Could not read breeding info: "+e;}
+}
+
+async function refreshBreedControls(){
+  try{
+    var reserved=await houses.babySlotReserved(manageTokenId);
+    var vals=await Promise.all([repro.pillToken(),repro.pillId(),repro.pillPerAttempt()]);
+    var pillAddr=vals[0],pillId=vals[1],per=vals[2];
+    var chosenId=Number(pillId)||CONFIG.pillIdFallback;
+    var token=(pillAddr&&pillAddr!==ethers.ZeroAddress)?pillAddr:CONFIG.pill1155;
+    var ok=true;
+    if(token){var e1155=new ethers.Contract(token,erc1155Abi,signer); var bal=await e1155.balanceOf(userAddress,chosenId); ok=(BigInt(bal)>=BigInt(per));}
+    var hasRole=await checkMinterRole();
+    $("tryBreed").disabled=!(reserved&&ok&&hasRole);
+  }catch(e){$("tryBreed").disabled=true;}
+}
+
+/* ========= WORKERS in House ========= */
+async function loadMyWorkersList(currentOccupants){
+  var cont=$("workersList"); cont.innerHTML="";
+  if(!userAddress){cont.innerHTML="<div class='hint'>Connect wallet.</div>";return;}
+  var nextId=0n; try{nextId=await workers.nextId();}catch(e){}
+  if(nextId===0n){cont.innerHTML="<div class='hint'>Cannot enumerate workers.</div>";return;}
+  var assigned={}; for(var i=0;i<(currentOccupants||[]).length;i++){assigned[String(currentOccupants[i])]=true;}
+  var maxId=Number(nextId)-1; var any=false;
+  for(var t=1;t<=maxId;t++){
+    try{
+      var o=await workers.ownerOf(t); if(o.toLowerCase()!==userAddress.toLowerCase()) continue; any=true;
+      var g=Number(await workers.genderOf(t)); var label=(g===1?"🟦 Male":(g===2?"🩷 Female":"⚪ Unknown"));
+      var rem=await mealManager.remainingMeal(t); var active=(rem>0n); var isAssigned=!!assigned[String(t)];
+      var card=document.createElement("div"); card.className="house-card";
+      card.innerHTML="" +
+        "<div class='id'>Worker #"+t+" <span class='chip "+(g===1?"male":"female")+"'>"+label+"</span></div>" +
+        "<div class='mut'>Meal: "+(active?("⏳ "+fmtDuration(rem)+" left"):"—")+"</div>" +
+        "<div class='house-actions'>" +
+          (isAssigned?"<button data-vac='"+t+"' class='btn-primary'>Vacate</button>":"<button data-assign='"+t+"' class='btn-green'>Assign</button>") +
+          "<button data-refuel='"+t+"' class='btn-primary "+(active?"dim":"")+"' "+(active?"disabled":"")+">Refuel 🍲</button>" +
+        "</div>";
+      cont.appendChild(card);
+    }catch(e){}
+  }
+  if(!any){cont.innerHTML="<div class='hint'>No workers found.</div>";}
+  var assigns=cont.querySelectorAll("button[data-assign]"); for(var a=0;a<assigns.length;a++){
+    assigns[a].onclick=function(){var id=Number(this.getAttribute("data-assign")); occupancy.assign(manageTokenId,id).then(function(tx){log("Assigning #"+id+"…");return tx.wait();}).then(function(){log("✅ Assigned #"+id);refreshManageModal();}).catch(function(e){log("❌ Assign error: "+e);});};
+  }
+  var vacs=cont.querySelectorAll("button[data-vac]"); for(var v=0;v<vacs.length;v++){
+    vacs[v].onclick=function(){var id=Number(this.getAttribute("data-vac")); occupancy.vacate(id).then(function(tx){log("Vacating #"+id+"…");return tx.wait();}).then(function(){log("✅ Vacated #"+id);refreshManageModal();}).catch(function(e){log("❌ Vacate error: "+e);});};
+  }
+  var refuels=cont.querySelectorAll("button[data-refuel]"); for(var r=0;r<refuels.length;r++){
+    refuels[r].onclick=(function(btn){return async function(){var id=Number(btn.getAttribute("data-refuel")); try{var cost=await mealManager.mealCostWGF(); if(cost>0n){await ensureAllowance(CONFIG.wgf,CONFIG.mealManager,cost,CONFIG.decimals.WGF,"WGF");} log("Refueling #"+id+" at House #"+manageTokenId+"…"); var tx=await mealManager.refuel(id,manageTokenId); await tx.wait(); log("✅ Refueled #"+id); refreshManageModal();}catch(e){log("❌ Refuel error: "+e);}};})(refuels[r]);
+  }
+}
+
+/* ========= WORKERS OVERVIEW ========= */
+function openWorkersModal(){$("workersBg").style.display="flex"; loadWorkersOverview();}
+function closeWorkersModal(){$("workersBg").style.display="none";$("workersOverview").innerHTML="";}
+async function loadWorkersOverview(){
+  var cont=$("workersOverview"); cont.innerHTML="";
+  if(!userAddress){cont.innerHTML="<div class='hint'>Connect wallet.</div>";return;}
+  var nextId=0n; try{nextId=await workers.nextId();}catch(e){}
+  if(nextId===0n){cont.innerHTML="<div class='hint'>Cannot enumerate workers.</div>";return;}
+  var maxId=Number(nextId)-1; var any=false;
+  for(var t=1;t<=maxId;t++){
+    try{
+      var o=await workers.ownerOf(t); if(o.toLowerCase()!==userAddress.toLowerCase()) continue; any=true;
+      var g=Number(await workers.genderOf(t)); var label=(g===1?"🟦 Male":(g===2?"🩷 Female":"⚪ Unknown"));
+      var house=await occupancy.housedAt(t); var hNum=Number(house);
+      var rem=await mealManager.remainingMeal(t); var active=(rem>0n);
+      var card=document.createElement("div"); card.className="house-card";
+      card.innerHTML="" +
+        "<div class='id'>Worker #"+t+" <span class='chip "+(g===1?"male":"female")+"'>"+label+"</span></div>" +
+        "<div class='mut'>Assigned to: "+(hNum>0?"<a href='#' data-open-house='"+hNum+"'>House #"+hNum+"</a>":"—")+"</div>" +
+        "<div class='mut'>Meal: "+(active?("⏳ "+fmtDuration(rem)+" left"):"—")+"</div>" +
+        "<div class='house-actions'>" +
+          (hNum>0?"<button data-vac='"+t+"' class='btn-primary'>Vacate</button>":"<button data-assign-hint='"+t+"' class='btn-green'>Assign via a house</button>") +
+          "<button data-refuel='"+t+"' class='btn-primary "+(active?"dim":"")+"' "+(active?"disabled":"")+">Refuel 🍲</button>" +
+        "</div>";
+      cont.appendChild(card);
+    }catch(e){}
+  }
+  if(!any){cont.innerHTML="<div class='hint'>No workers found.</div>";}
+  var links=cont.querySelectorAll("a[data-open-house]"); for(var i=0;i<links.length;i++){
+    links[i].onclick=function(ev){ev.preventDefault();var h=Number(this.getAttribute("data-open-house")); closeWorkersModal(); openManageModal(h); };
+  }
+  var vacs=cont.querySelectorAll("button[data-vac]"); for(var v=0;v<vacs.length;v++){
+    vacs[v].onclick=function(){var id=Number(this.getAttribute("data-vac")); occupancy.vacate(id).then(function(tx){log("Vacating #"+id+"…");return tx.wait();}).then(function(){log("✅ Vacated #"+id); loadWorkersOverview(); if(manageTokenId){refreshManageModal();} }).catch(function(e){log("❌ Vacate error: "+e);});};
+  }
+  var hints=cont.querySelectorAll("button[data-assign-hint]"); for(var h=0;h<hints.length;h++){hints[h].onclick=function(){log("Tip: open a yellow house on the grid to assign workers there.");};}
+  var refuels=cont.querySelectorAll("button[data-refuel]"); for(var r=0;r<refuels.length;r++){
+    refuels[r].onclick=(function(btn){return async function(){var id=Number(btn.getAttribute("data-refuel")); try{var cost=await mealManager.mealCostWGF(); if(cost>0n){await ensureAllowance(CONFIG.wgf,CONFIG.mealManager,cost,CONFIG.decimals.WGF,"WGF");} var curr=await occupancy.housedAt(id); var hId=Number(curr)||(manageTokenId||0); if(!hId){log("Select/open a house first.");return;} log("Refueling #"+id+" at House #"+hId+"…"); var tx=await mealManager.refuel(id,hId); await tx.wait(); log("✅ Refueled #"+id); loadWorkersOverview(); if(manageTokenId){refreshManageModal();} }catch(e){log("❌ Refuel error: "+e);}};})(refuels[r]);
+  }
+}
+
+/* ========= BREEDING ========= */
+async function approvePillOperator(){
+  try{
+    if(!signer) await connectWallet();
+    const token = CONFIG.pill1155;           // use your known ERC1155
+    const operator = CONFIG.repro;          // ReproductionManager
+    const c = new ethers.Contract(token, erc1155Abi, signer);
+    const ok = await c.isApprovedForAll(userAddress, operator);
+    if (ok){ log("✅ Pills already approved for ReproductionManager."); await refreshBreedControls(); return; }
+    log(`Requesting ERC1155 setApprovalForAll(${operator}) on ${token}…`);
+    const tx = await c.setApprovalForAll(operator, true);
+    await tx.wait();
+    log("✅ Pills approved for ReproductionManager.");
+    await refreshBreedControls();
+  } catch(e){
+    log("❌ ERC1155 approval error: " + (e?.reason || e?.data?.message || e?.message || e));
+  }
+}
+
+async function attemptBreed(){
+  if(!manageTokenId){log("Open a house first.");return;}
+  var motherId=Number($("motherSel").value||0), fatherId=Number($("fatherSel").value||0);
+  if(!motherId||!fatherId){log("Pick both parents.");return;} if(motherId===fatherId){log("Parents must differ.");return;}
+  try{
+    // MINTER_ROLE gate
+    var hasRole=await checkMinterRole();
+    if(!hasRole){log("ReproductionManager lacks MINTER_ROLE on Workers.");return;}
+
+    var reserved=await houses.babySlotReserved(manageTokenId); if(!reserved){log("Reserve baby slot first.");return;}
+    var nextAt=await repro.nextAttemptTime(motherId,fatherId,manageTokenId); var now=Math.floor(Date.now()/1000);
+    if(Number(nextAt)>now){log("Cooldown. Next: "+fmtDate(nextAt));return;}
+    var vals=await Promise.all([repro.pillToken(),repro.pillId(),repro.pillPerAttempt()]);
+    var pillAddr=vals[0],pillId=vals[1],per=vals[2]; var token=(pillAddr&&pillAddr!==ethers.ZeroAddress)?pillAddr:CONFIG.pill1155; var chosen=Number(pillId)||CONFIG.pillIdFallback;
+    var e1155=new ethers.Contract(token,erc1155Abi,signer); var bal=await e1155.balanceOf(userAddress,chosen);
+    if(BigInt(bal)<BigInt(per)){log("Not enough pills: have "+bal+", need "+per); await refreshBreedControls(); return;}
+    await ensure1155Approval(token,CONFIG.repro);
+    log("Attempting pregnancy…");
+    var tx=await repro.attempt(motherId,fatherId,manageTokenId); var rec=await tx.wait();
+    var parsed=null; if(reproIface){for(var i=0;i<rec.logs.length;i++){try{var e=reproIface.parseLog(rec.logs[i]); if(e&&e.name==="PregnancyAttempted"){parsed=e.args;break;}}catch(err){}}}
+    if(parsed){
+      var succ=parsed.success, baby=parsed.babyTokenId, ntime=parsed.nextEligibleAt;
+      var msg=succ?("🎉 Success! Baby token: #"+baby+" • Next at "+fmtDate(ntime)):("❌ Failed. Next at "+fmtDate(ntime));
+      $("breedResult").textContent=msg; log(msg);
+    }else{ $("breedResult").textContent="Attempt sent (event not parsed)"; log("Attempt tx: "+tx.hash); }
+    await refreshManageModal();
+  }catch(e){log("❌ Breed error: "+e);}
+}
+
+/* ========= BALANCES ========= */
+function openBalancesModal(){$("balancesBg").style.display="flex"; loadBalances();}
+function closeBalancesModal(){$("balancesBg").style.display="none";$("balancesGrid").innerHTML="";$("pillMeta").textContent="—";}
+async function loadBalances(){
+  if(!userAddress){$("balancesGrid").innerHTML="<div class='hint'>Connect wallet.</div>";return;}
+  var vals=await Promise.all([
+    provider.getBalance(userAddress),
+    (new ethers.Contract(CONFIG.usdc,erc20Abi,signer)).balanceOf(userAddress),
+    (new ethers.Contract(CONFIG.wgu,erc20Abi,signer)).balanceOf(userAddress),
+    (new ethers.Contract(CONFIG.wgf,erc20Abi,signer)).balanceOf(userAddress),
+    repro.pillToken(), repro.pillId(), repro.pillPerAttempt()
+  ]);
+  var ethBal=vals[0], usdcBal=vals[1], wguBal=vals[2], wgfBal=vals[3];
+  var pillAddr=vals[4], pillId=vals[5], per=vals[6];
+  var token=(pillAddr&&pillAddr!==ethers.ZeroAddress)?pillAddr:CONFIG.pill1155; var chosen=Number(pillId)||CONFIG.pillIdFallback;
+  var pillBal=0n; if(token){var e1155=new ethers.Contract(token,erc1155Abi,signer); pillBal=await e1155.balanceOf(userAddress,chosen);}
+  $("balancesGrid").innerHTML="" +
+    "<div class='balance-card'><h4>ETH</h4><div>"+ethers.formatEther(ethBal)+" ETH</div></div>" +
+    "<div class='balance-card'><h4>USDC</h4><div>"+fmt(usdcBal,CONFIG.decimals.USDC)+" USDC</div></div>" +
+    "<div class='balance-card'><h4>WGU</h4><div>"+fmt(wguBal,CONFIG.decimals.WGU)+" WGU</div></div>" +
+    "<div class='balance-card'><h4>WGF (Food)</h4><div>"+fmt(wgfBal,CONFIG.decimals.WGF)+" WGF</div></div>" +
+    "<div class='balance-card'><h4>Pills (ERC1155)</h4><div>ID "+chosen+": "+pillBal.toString()+"</div></div>";
+  $("pillMeta").innerHTML="Reproduction requires <b>"+per+"</b> pill(s) per attempt • Pill token: <code>"+token+"</code> • Pill ID: <b>"+chosen+"</b>";
+}
+
+/* ========= UI WIRING ========= */
+$("connectBtn").onclick=connectWallet;
+$("buyHouseBtn").onclick=function(){pendingPlacePlotId=null; openHousesModal(false);};
+$("myHousesBtn").onclick=function(){pendingPlacePlotId=null; openHousesModal(false);};
+$("mintFromModal").onclick=function(){var pay=$("payUSDC").checked?"USDC":"WGU"; buyHouse(pay);};
+$("closeModal").onclick=closeHousesModal;
+
+$("closeManage").onclick=closeManageModal;
+$("toggleBabySlot").onclick=async function(){
+  if(!manageTokenId) return;
+  try{
+    var res=await houses.babySlotReserved(manageTokenId);
+    var tx=await houses.setBabySlotReserved(manageTokenId,!res);
+    log((res?"Releasing":"Reserving")+" baby slot…"); await tx.wait(); log("✅ Baby slot toggled"); refreshManageModal();
+  }catch(e){log("❌ Toggle slot error: "+e);}
+};
+$("approvePill").onclick=approvePillOperator;
+$("tryBreed").onclick=attemptBreed;
+
+$("myWorkersBtn").onclick=openWorkersModal;
+$("closeWorkers").onclick=closeWorkersModal;
+
+$("balancesBtn").onclick=openBalancesModal;
+$("closeBalances").onclick=closeBalancesModal;
+
+window.addEventListener("load",function(){log("🌐 Ready. Click Connect (Arbitrum One).");});
+</script>
+</body>
+</html>
